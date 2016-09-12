@@ -129,13 +129,13 @@ func (r sortableRunes) Less(a, b int) bool { return r[a] < r[b] }
 //
 // Example usage:
 //
-//	w.Write([]byte("func matchFoo(input string) int {\n"))
+//	fmt.Fprintln(w, "func matchFoo(input string) int {")
 //	fastmatch.Generate(w, map[string]string{
 //		"foo": "1",
 //		"bar": "2",
 //		"baz": "3",
 //	}, "-1", fastmatch.Insensitive)
-func Generate(w io.Writer, cases map[string]string, none string, flags ...flag) {
+func Generate(w io.Writer, origCases map[string]string, none string, flags ...flag) {
 	var insensitive, normalize bool
 	for _, flag := range flags {
 		switch flag {
@@ -148,13 +148,16 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...flag) 
 	_ = normalize // TODO: someday we'll support unicode normalization
 
 	// Search is partitioned based on the length of the input.  Split
-	// cases into each possible search space.
+	// cases into each possible search space.  Make a copy of the map
+	// while we're at it, normalized for case.
 	keys := make(map[int][]string)
-	for key := range cases {
+	cases := make(map[string]string, len(origCases))
+	for key, value := range origCases {
 		if insensitive {
 			key = strings.ToLower(key)
 		}
 		keys[len(key)] = append(keys[len(key)], key)
+		cases[key] = value
 	}
 	lengths := make([]int, 0, len(keys))
 	for len := range keys {
@@ -162,10 +165,11 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...flag) 
 	}
 	sort.Ints(lengths)
 
-	fmt.Fprint(w, "\tswitch len(input) {\n")
+	fmt.Fprintln(w, "\tswitch len(input) {")
 	for _, l := range lengths {
-		fmt.Fprintf(w, "\tcase %d:\n", l)
-		fmt.Fprint(w, "\t\tvar state uint64\n")
+		fmt.Fprintf(w, "\tcase %d:", l)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "\t\tvar state uint64")
 
 		// State machine housekeeping.  There's a unique state machine
 		// for each search space.
@@ -210,23 +214,25 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...flag) 
 
 			// Output code which increments state based on which
 			// rune was seen:
-			fmt.Fprintf(w, "\t\tswitch input[%d] {\n", offset)
+			fmt.Fprintf(w, "\t\tswitch input[%d] {", offset)
+			fmt.Fprintln(w)
 			for _, r := range runes {
 				fmt.Fprintf(w, "\t\tcase '%c'", r)
 				if insensitive && unicode.IsLower(r) {
 					fmt.Fprintf(w, ", '%c'", unicode.ToUpper(r))
 				}
-				fmt.Fprint(w, ":\n")
-				fmt.Fprintf(w, "\t\t\tstate += 0x%x\n", states[r])
+				fmt.Fprintln(w, ":")
+				fmt.Fprintf(w, "\t\t\tstate += 0x%x", states[r])
+				fmt.Fprintln(w)
 			}
-			fmt.Fprint(w, "\t\tdefault:\n")
-			fmt.Fprintf(w, "\t\t\treturn %s\n", none)
-			fmt.Fprintf(w, "\t\t}\n")
+			fmt.Fprintln(w, "\t\tdefault:")
+			fmt.Fprintln(w, "\t\t\treturn", none)
+			fmt.Fprintln(w, "\t\t}")
 		}
 
 		// Now output code to compare actual state to possible final
 		// values:
-		fmt.Fprintf(w, "\t\tswitch state {\n")
+		fmt.Fprintln(w, "\t\tswitch state {")
 		for _, key := range keys[l] {
 			fmt.Fprint(w, "\t\tcase ")
 			for i, state := range final[key] {
@@ -235,12 +241,12 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...flag) 
 				}
 				fmt.Fprintf(w, "0x%x", state)
 			}
-			fmt.Fprint(w, ":\n")
-			fmt.Fprint(w, "\t\t\treturn ", cases[key], "\n")
+			fmt.Fprintln(w, ":")
+			fmt.Fprintln(w, "\t\t\treturn", cases[key])
 		}
-		fmt.Fprintf(w, "\t\t}\n")
+		fmt.Fprintln(w, "\t\t}")
 	}
-	fmt.Fprint(w, "\t}\n")
-	fmt.Fprintf(w, "\treturn %s\n", none)
-	fmt.Fprint(w, "}\n")
+	fmt.Fprintln(w, "\t}")
+	fmt.Fprintln(w, "\treturn", none)
+	fmt.Fprintln(w, "}")
 }
