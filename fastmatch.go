@@ -82,34 +82,112 @@ or binary searches.  In Go, the difference is probably less noticeable.
 
 This probably isn't the tool to use if your possible matches are very long or
 you have a ridiculous number of them, since the state machine counter has to
-fit within a uint64.  It will panic at code generation time if this limit is
-exceeded.
+fit within a uint64.  It will return an error at code generation time if this
+limit is exceeded.
 
 */
 package fastmatch
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"sort"
 	"strconv"
-	"strings"
-	"unicode"
 )
 
-type flag int
+type flag struct {
+	equivalent []rune
+}
 
-const (
-	Insensitive flag = iota
-	Normalize
-)
+// Insensitive is a flag, which can be passed to Generate, to specify that
+// matching should be case-insensitive.
+var Insensitive = new(flag)
 
+// Normalize is a flag, which can be passed to Generate, to specify that
+// matching should be done without regard to diacritics, accents, etc.
+//
+// This is not currently implemented.
+var Normalize = new(flag)
+
+// Equivalent is a flag, which can be passed to Generate, to specify
+// runes that should be treated identically when matching.
+func Equivalent(runes ...rune) *flag {
+	return &flag{equivalent: runes}
+}
+
+// sortableRunes implements sort.Sortable on a slice of runes.
 type sortableRunes []rune
 
 func (r sortableRunes) Len() int           { return len(r) }
 func (r sortableRunes) Swap(a, b int)      { r[a], r[b] = r[b], r[a] }
 func (r sortableRunes) Less(a, b int) bool { return r[a] < r[b] }
+
+// runeEquivalents holds our map of which runes are equivalent to each other.
+type runeEquivalents map[rune]sortableRunes
+
+// dedupedRuneEquivalents is used internally in the construction of
+// runeEquivalents.
+type dedupedRuneEquivalents map[rune]map[rune]bool
+
+// set adds a rune key and value to dedupedRuneEquivalents, calling make() on
+// the second-level map as needed.
+func (equiv dedupedRuneEquivalents) set(r1, r2 rune) {
+	if _, exists := equiv[r1]; !exists {
+		equiv[r1] = make(map[rune]bool, 2)
+		equiv[r1][r1] = true
+	}
+	equiv[r1][r2] = true
+}
+
+// collapse converts dedupedRuneEquivalents to runeEquivalents.
+func (equiv dedupedRuneEquivalents) collapse() runeEquivalents {
+	newEquiv := make(runeEquivalents, len(equiv))
+	for r1, rm := range equiv {
+		newEquiv[r1] = make(sortableRunes, 0, len(rm))
+		for r2 := range rm {
+			newEquiv[r1] = append(newEquiv[r1], r2)
+		}
+		sort.Sort(newEquiv[r1])
+	}
+	return newEquiv
+}
+
+// makeRuneEquivalents builds our rune equivalence map based on flags.
+func makeRuneEquivalents(flags ...*flag) runeEquivalents {
+	equiv := make(dedupedRuneEquivalents)
+
+	for _, f := range flags {
+		if f == Insensitive {
+			for lower := 'a'; lower <= 'z'; lower++ {
+				upper := 'A' + (lower - 'a')
+				equiv.set(lower, upper)
+				equiv.set(upper, lower)
+			}
+		} else if f == Normalize {
+			continue // TODO: not yet implemented
+		} else if len(f.equivalent) > 0 {
+			for _, i := range f.equivalent {
+				for _, j := range f.equivalent {
+					equiv.set(i, j)
+				}
+			}
+		}
+	}
+
+	return equiv.collapse()
+}
+
+// lookup returns a map entry from runeEquivalents, defaulting to a slice
+// containing just the lookup key if there are no equivalents for that rune.
+func (equiv runeEquivalents) lookup(r rune) []rune {
+	if rs, found := equiv[r]; found {
+		return rs
+	} else {
+		return []rune{r}
+	}
+}
 
 // Generate outputs Go code to compare a string to a set of possible matches
 // which are known at compile-time.
@@ -123,11 +201,6 @@ func (r sortableRunes) Less(a, b int) bool { return r[a] < r[b] }
 // and any input pre-processing logic.  The string to examine should be in a
 // variable named "input".
 //
-// If the Insensitive flag is supplied, the comparison will be
-// case-insensitive.  The Normalize flag indicates Unicode characters should
-// be normalized (for instance by ignoring diacritics), but this functionality
-// is not yet implemented.
-//
 // Example usage:
 //
 //	fmt.Fprintln(w, "func matchFoo(input string) int {")
@@ -136,29 +209,14 @@ func (r sortableRunes) Less(a, b int) bool { return r[a] < r[b] }
 //		"bar": "2",
 //		"baz": "3",
 //	}, "-1", fastmatch.Insensitive)
-func Generate(w io.Writer, origCases map[string]string, none string, flags ...flag) {
-	var insensitive, normalize bool
-	for _, flag := range flags {
-		switch flag {
-		case Insensitive:
-			insensitive = true
-		case Normalize:
-			normalize = true
-		}
-	}
-	_ = normalize // TODO: someday we'll support unicode normalization
+func Generate(w io.Writer, cases map[string]string, none string, flags ...*flag) error {
+	equiv := makeRuneEquivalents(flags...)
 
 	// Search is partitioned based on the length of the input.  Split
-	// cases into each possible search space.  Make a copy of the map
-	// while we're at it, normalized for case.
+	// cases into each possible search space.
 	keys := make(map[int][]string)
-	cases := make(map[string]string, len(origCases))
-	for key, value := range origCases {
-		if insensitive {
-			key = strings.ToLower(key)
-		}
+	for key := range cases {
 		keys[len(key)] = append(keys[len(key)], key)
-		cases[key] = value
 	}
 	lengths := make([]int, 0, len(keys))
 	for len := range keys {
@@ -166,7 +224,9 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...fl
 	}
 	sort.Ints(lengths)
 
-	fmt.Fprintln(w, "\tswitch len(input) {")
+	if _, err := fmt.Fprintln(w, "\tswitch len(input) {"); err != nil {
+		return err
+	}
 	for _, l := range lengths {
 		fmt.Fprintf(w, "\tcase %d:", l)
 		fmt.Fprintln(w)
@@ -186,41 +246,51 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...fl
 			// runes at this offset:
 			runes := sortableRunes(make([]rune, 0, len(keys[l])))
 			runesSeen := make(map[rune]bool, len(keys[l]))
+		possibilities:
 			for _, key := range keys[l] {
 				r := rune(key[offset])
-				if !runesSeen[r] {
-					runes = append(runes, r)
-					runesSeen[r] = true
+				for _, r2 := range equiv.lookup(r) {
+					if runesSeen[r2] {
+						continue possibilities
+					}
+					runesSeen[r2] = true
 				}
+				runes = append(runes, r)
 			}
 			sort.Sort(runes)
 
-			// Assign a unique state value to each possible rune,
-			// and track the relationship between state values and
-			// matches:
+			// Assign a unique state value to each possible rune
+			// (including equivalents), and track the relationship
+			// between state values and matches:
 			base = next
 			states := make(map[rune]uint64, len(keys[l]))
 			for _, r := range runes {
 				states[r] = next
 				for _, key := range keys[l] {
-					if rune(key[offset]) == r {
-						final[key][offset] = next
+					for _, r2 := range equiv.lookup(r) {
+						if rune(key[offset]) == r2 {
+							final[key][offset] = next
+							break
+						}
 					}
 				}
 				if base > math.MaxUint64-next {
-					panic("too many values to match!  uint64 overflow!")
+					return errors.New("too many values to match!  uint64 overflow!")
 				}
 				next += base
 			}
 
 			// Output code which increments state based on which
-			// rune was seen:
+			// rune (or equivalent) was seen:
 			fmt.Fprintf(w, "\t\tswitch input[%d] {", offset)
 			fmt.Fprintln(w)
 			for _, r := range runes {
-				fmt.Fprintf(w, "\t\tcase '%c'", r)
-				if insensitive && unicode.IsLower(r) {
-					fmt.Fprintf(w, ", '%c'", unicode.ToUpper(r))
+				fmt.Fprint(w, "\t\tcase ")
+				for n, r2 := range equiv.lookup(r) {
+					if n != 0 {
+						fmt.Fprint(w, ", ")
+					}
+					fmt.Fprintf(w, "'%c'", r2)
 				}
 				fmt.Fprintln(w, ":")
 				fmt.Fprintf(w, "\t\t\tstate += 0x%x", states[r])
@@ -236,8 +306,8 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...fl
 		fmt.Fprintln(w, "\t\tswitch state {")
 		for _, key := range keys[l] {
 			fmt.Fprint(w, "\t\tcase ")
-			for i, state := range final[key] {
-				if i != 0 {
+			for n, state := range final[key] {
+				if n != 0 {
 					fmt.Fprintf(w, " + ")
 				}
 				fmt.Fprintf(w, "0x%x", state)
@@ -250,6 +320,8 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...fl
 	fmt.Fprintln(w, "\t}")
 	fmt.Fprintln(w, "\treturn", none)
 	fmt.Fprintln(w, "}")
+
+	return nil
 }
 
 // GenerateReverse outputs Go code that returns the string value for a given
@@ -258,14 +330,19 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...fl
 //
 // If more than one string maps to the same value, the code generated by this
 // function will not be valid.
-func GenerateReverse(w io.Writer, cases map[string]string, none string) {
+//
+// This function accepts flags (in order to match Generate's function
+// signature), but they are currently ignored.
+func GenerateReverse(w io.Writer, cases map[string]string, none string, _ ...*flag) error {
 	keys := make([]string, 0, len(cases))
 	for key := range cases {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 
-	fmt.Fprintln(w, "\tswitch input {")
+	if _, err := fmt.Fprintln(w, "\tswitch input {"); err != nil {
+		return err
+	}
 	for _, key := range keys {
 		fmt.Fprintf(w, "\tcase %s:", cases[key])
 		fmt.Fprintln(w)
@@ -275,4 +352,6 @@ func GenerateReverse(w io.Writer, cases map[string]string, none string) {
 	fmt.Fprintln(w, "\t\treturn", none)
 	fmt.Fprintln(w, "\t}")
 	fmt.Fprintln(w, "}")
+
+	return nil
 }
