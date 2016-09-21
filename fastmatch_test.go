@@ -34,10 +34,41 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 )
 
+// TestRuneEquivalents tests the construction of runeEquivalents via flags,
+// including sorting, de-duping, and transitivity.
+func TestRuneEquivalents(t *testing.T) {
+	equiv := makeRuneEquivalents(
+		Equivalent('a', 'b'),
+		Equivalent('B', 'c'),
+		Insensitive,
+		Equivalent('c', 'd'),
+		Equivalent('a', 'c', 'd'),
+	)
+
+	expect := []rune{'A', 'B', 'C', 'D', 'a', 'b', 'c', 'd'}
+	for _, r := range expect {
+		if !reflect.DeepEqual(expect, equiv.lookup(r)) {
+			t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup(r), r)
+		}
+	}
+
+	expect = []rune{'E', 'e'}
+	if !reflect.DeepEqual(expect, equiv.lookup('e')) {
+		t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup('e'), 'e')
+	}
+
+	expect = []rune{'.'}
+	if !reflect.DeepEqual(expect, equiv.lookup('.')) {
+		t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup('.'), '.')
+	}
+}
+
+// generateFunc matches both Generate() and GenerateReverse().
 type generateFunc func(io.Writer, map[string]string, string, ...*flag) error
 
 // generateRunnable creates a temporary directory, adds it GOPATH, and uses
@@ -129,7 +160,7 @@ func TestNoFlags(t *testing.T) {
 func TestInsensitive(t *testing.T) {
 	err, cleanup := generateRunnable(Generate, "int", map[string]string{
 		"foo": "1",
-		"bar": "2",
+		"Bar": "2",
 		"baz": "3",
 	}, "0", Insensitive)
 	defer cleanup()
@@ -178,6 +209,16 @@ func TestReverse(t *testing.T) {
 	expectMatch(t, "0", "baz")
 }
 
+// TestOverflow attempts to Generate matcher code for a string that is too
+// long, and overflows the uint64 state machine.
+func TestOverflow(t *testing.T) {
+	tooLong := "Anything longer than about 64 characters should do.  This should do nicely."
+	err := Generate(ioutil.Discard, map[string]string{tooLong: "1"}, "0")
+	if err == nil {
+		t.Errorf("long match didn't trigger overflow")
+	}
+}
+
 // TestBadWriter tests that Generate and GenerateReverse return an error
 // if passed an unusable io.Writer.
 func TestBadFileHandle(t *testing.T) {
@@ -185,10 +226,49 @@ func TestBadFileHandle(t *testing.T) {
 	f.Close()
 	os.Remove(f.Name())
 
-	if err := Generate(f, map[string]string{}, "int"); err == nil {
+	if err := Generate(f, map[string]string{}, "0"); err == nil {
 		t.Errorf("no error from Generate on closed io.Writer")
 	}
-	if err := GenerateReverse(f, map[string]string{}, "int"); err == nil {
+	if err := GenerateReverse(f, map[string]string{}, `""`); err == nil {
 		t.Errorf("no error from GenerateReverse on closed io.Writer")
+	}
+}
+
+// TestAmbiguity tests that an error is returned if we're asked to generate
+// code with ambiguous matches, i.e. two strings that are equivalent to each
+// other but should return different values.
+func TestAmbiguity(t *testing.T) {
+	err := Generate(ioutil.Discard, map[string]string{
+		"Foo": "1",
+		"foo": "2",
+		"Bar": "3",
+		"bar": "4",
+	}, "0", Insensitive)
+	if err == nil {
+		t.Errorf("failed to detect ambiguity")
+	}
+
+	// At first glance, this looks ambiguous, but since the equivalent
+	// strings both return the same value, it's actually OK.
+	err = Generate(ioutil.Discard, map[string]string{
+		"Foo": "1",
+		"foo": "1",
+	}, "0", Insensitive)
+	if err != nil {
+		t.Errorf("erroneously detected \"Foo\" = 1 and \"foo\" = 1 as ambiguous: %s", err.Error())
+	}
+}
+
+// TestReverseAmbiguity tests that an error is returned if GenerateReverse is
+// called with multiple strings mapping to the same expression.
+func TestReverseAmbiguity(t *testing.T) {
+	err := GenerateReverse(ioutil.Discard, map[string]string{
+		"foo": "1",
+		"bar": "1",
+		"baz": "2",
+		"bat": "2",
+	}, `""`)
+	if err == nil {
+		t.Errorf("failed to detect ambiguity")
 	}
 }
