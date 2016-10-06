@@ -69,7 +69,7 @@ func TestRuneEquivalents(t *testing.T) {
 }
 
 // generateFunc matches both Generate() and GenerateReverse().
-type generateFunc func(io.Writer, map[string]string, string, ...*flag) error
+type generateFunc func(io.Writer, map[string]string, string, ...*Flag) error
 
 // generateRunnable creates a temporary directory, adds it GOPATH, and uses
 // Generate to create runnable string matcher code therein.
@@ -77,7 +77,7 @@ type generateFunc func(io.Writer, map[string]string, string, ...*flag) error
 // A cleanup function is returned, which should be executed by the caller at
 // the completion of the test.  This removes the temporary directory and
 // restores GOPATH and the current working directory.
-func generateRunnable(fn generateFunc, retType string, cases map[string]string, none string, flags ...*flag) (error, func()) {
+func generateRunnable(fn generateFunc, retType string, cases map[string]string, none string, flags ...*Flag) (func(), error) {
 	cleanup := func() {}
 
 	var out io.Writer
@@ -97,7 +97,7 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 		}
 	}
 	if err != nil {
-		return err, cleanup
+		return cleanup, err
 	}
 
 	fmt.Fprintln(out, "package main")
@@ -112,7 +112,7 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 	fmt.Fprintln(out, "func match(input string)", retType, "{")
 	err = fn(out, cases, none, flags...)
 	if err != nil {
-		return err, cleanup
+		return cleanup, err
 	}
 	fmt.Fprintln(out)
 
@@ -120,7 +120,7 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 	fmt.Fprintln(out, "\tfmt.Println(match(os.Args[1]))")
 	fmt.Fprintln(out, "}")
 
-	return nil, cleanup
+	return cleanup, nil
 }
 
 // expectMatch uses `go run` to execute our generated test.go file.  It passes
@@ -140,7 +140,7 @@ func expectMatch(t *testing.T, input, expect string) {
 
 // TestNoFlags tests a simple matcher.
 func TestNoFlags(t *testing.T) {
-	err, cleanup := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(Generate, "int", map[string]string{
 		"foo": "1",
 		"bar": "2",
 		"baz": "3",
@@ -158,7 +158,7 @@ func TestNoFlags(t *testing.T) {
 
 // TestInsensitive tests a case-insensitive matcher.
 func TestInsensitive(t *testing.T) {
-	err, cleanup := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(Generate, "int", map[string]string{
 		"foo": "1",
 		"Bar": "2",
 		"baz": "3",
@@ -176,7 +176,7 @@ func TestInsensitive(t *testing.T) {
 
 // TestEquivalent tests a matcher which makes use of the Equivalent flag.
 func TestEquivalent(t *testing.T) {
-	err, cleanup := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(Generate, "int", map[string]string{
 		"foo00000": "1",
 		"bar11111": "2",
 	}, "0", Equivalent('0', '1', '2', '3', '4', '5', '6', '7', '8', '9'))
@@ -195,7 +195,7 @@ func TestEquivalent(t *testing.T) {
 
 // TestReverse tests a simple reverse matcher.
 func TestReverse(t *testing.T) {
-	err, cleanup := generateRunnable(GenerateReverse, "string", map[string]string{
+	cleanup, err := generateRunnable(GenerateReverse, "string", map[string]string{
 		"foo": `"1"`,
 		"bar": `"2"`,
 	}, `"baz"`)
@@ -209,13 +209,24 @@ func TestReverse(t *testing.T) {
 	expectMatch(t, "0", "baz")
 }
 
-// TestOverflow attempts to Generate matcher code for a string that is too
-// long, and overflows the uint64 state machine.
+// TestOverflow attempts to Generate matcher code for strings that are too
+// long, which overflow the uint64 state machine.
 func TestOverflow(t *testing.T) {
-	tooLong := "Anything longer than about 64 characters should do.  This should do nicely."
-	err := Generate(ioutil.Discard, map[string]string{tooLong: "1"}, "0")
+	tooLong1 := "Anything longer than about 64 characters should do nicely.  But"
+	tooLong2 := "we need more than one match, so that the state counter is used."
+	err := Generate(ioutil.Discard, map[string]string{
+		tooLong1: "1",
+		tooLong2: "2",
+	}, "0")
 	if err == nil {
-		t.Errorf("long match didn't trigger overflow")
+		t.Fatalf("long match didn't trigger overflow")
+	}
+
+	err = Generate(ioutil.Discard, map[string]string{
+		tooLong1: "1",
+	}, "0")
+	if err != nil {
+		t.Errorf("a single match shouldn't overflow, since state machine is unnecessary")
 	}
 }
 

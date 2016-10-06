@@ -85,8 +85,15 @@ Is the code output by this package faster enough to matter?  Maybe, maybe not.
 This is a straight port of a C code generation tool I've used on a couple of
 projects.  In C, the difference was significant, due to strcmp() or
 strcasecmp() function call overhead, and GCC's ability to convert long switch
-statements into jump tables or binary searches.  In Go, the speed difference
-is probably less noticeable.
+statements into jump tables or binary searches.
+
+Go (as of 1.7) doesn't yet do any optimization of switch statements.  See
+https://github.com/golang/go/issues/5496 and
+https://github.com/golang/go/issues/15780.  Thus, you may actually be worse
+off in the short-term for using this method instead of a map lookup.  But as
+the compiler improves, this code will become more relevant.  (I've played with
+having this package output assembler code, but it seems like the effort would
+be better spent improving the compiler instead.)
 
 This probably isn't the right tool to use if your possible matches are longer
 than short words or phrases, or if you have a ridiculous number of them, since
@@ -105,25 +112,29 @@ import (
 	"strconv"
 )
 
-type flag struct {
+// Flag can be passed to Generate and GenerateReverse to modify the functions'
+// behavior.  Users of this package should not instantiate their own Flags.
+// Rather, they should use one of Insensitive, Normalize, or the return value
+// from Equivalent().  Unknown Flags are ignored.
+type Flag struct {
 	equivalent []rune
 }
 
 // Insensitive is a flag, which can be passed to Generate, to specify that
 // matching should be case-insensitive.
-var Insensitive = new(flag)
+var Insensitive = new(Flag)
 
 // Normalize is a flag, which can be passed to Generate, to specify that
 // matching should be done without regard to diacritics, accents, etc.
 //
 // This is currently just a placeholder, and has no effect yet on the
 // generated code.
-var Normalize = new(flag)
+var Normalize = new(Flag)
 
 // Equivalent is a flag, which can be passed to Generate, to specify
 // runes that should be treated identically when matching.
-func Equivalent(runes ...rune) *flag {
-	return &flag{equivalent: runes}
+func Equivalent(runes ...rune) *Flag {
+	return &Flag{equivalent: runes}
 }
 
 // sortableRunes implements sort.Sortable on a slice of runes.
@@ -187,7 +198,7 @@ func (equiv dedupedRuneEquivalents) collapse() runeEquivalents {
 }
 
 // makeRuneEquivalents builds our rune equivalence map based on flags.
-func makeRuneEquivalents(flags ...*flag) runeEquivalents {
+func makeRuneEquivalents(flags ...*Flag) runeEquivalents {
 	equiv := make(dedupedRuneEquivalents)
 
 	for _, f := range flags {
@@ -203,10 +214,6 @@ func makeRuneEquivalents(flags ...*flag) runeEquivalents {
 			for _, r := range f.equivalent {
 				equiv.set(r, f.equivalent...)
 			}
-		} else {
-			// Shouldn't be reachable if package exports are
-			// honored, since flag is package-private:
-			panic("unknown flag")
 		}
 	}
 
@@ -218,9 +225,8 @@ func makeRuneEquivalents(flags ...*flag) runeEquivalents {
 func (equiv runeEquivalents) lookup(r rune) []rune {
 	if rs, found := equiv[r]; found {
 		return rs
-	} else {
-		return []rune{r}
 	}
+	return []rune{r}
 }
 
 // stateMachine holds the mapping between a match and the intermediate state
@@ -260,7 +266,7 @@ func (state *stateMachine) shift() {
 // too many intermediate states to fit in a uint64.
 func (state *stateMachine) increment() error {
 	if state.base > math.MaxUint64-state.next {
-		return errors.New("too many values to match: uint64 overflow!")
+		return errors.New("too many values to match (uint64 overflow)")
 	}
 	state.next += state.base
 	return nil
@@ -321,9 +327,8 @@ func (state *stateMachine) checkAmbiguity(cases map[string]string) error {
 
 	if b.Len() == 0 {
 		return nil
-	} else {
-		return errors.New(b.String())
 	}
+	return errors.New(b.String())
 }
 
 // finalString returns a string representing the final state of each key.  To
@@ -372,7 +377,7 @@ func (state *stateMachine) finalString(key string) string {
 //		"bar": "2",
 //		"baz": "3",
 //	}, "-1", fastmatch.Insensitive)
-func Generate(w io.Writer, cases map[string]string, none string, flags ...*flag) error {
+func Generate(w io.Writer, cases map[string]string, none string, flags ...*Flag) error {
 	equiv := makeRuneEquivalents(flags...)
 
 	// Search is partitioned based on the length of the input.  Split
@@ -417,22 +422,25 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...*flag)
 			}
 			sort.Sort(runes)
 
-			// Assign a unique state value to each possible rune
-			// (including equivalents):
-			state.shift()
-			runeStates := make(map[rune]uint64, len(keys[l]))
-			for _, r := range runes {
-				runeStates[r] = state.next
-				for _, key := range keys[l] {
-					for _, r2 := range equiv.lookup(r) {
-						if rune(key[offset]) == r2 {
-							state.accumulate(key)
-							break
+			var runeStates map[rune]uint64
+			if len(runes) > 1 {
+				// Assign a unique state value to each possible rune
+				// (including equivalents):
+				state.shift()
+				runeStates = make(map[rune]uint64, len(keys[l]))
+				for _, r := range runes {
+					runeStates[r] = state.next
+					for _, key := range keys[l] {
+						for _, r2 := range equiv.lookup(r) {
+							if rune(key[offset]) == r2 {
+								state.accumulate(key)
+								break
+							}
 						}
 					}
-				}
-				if err := state.increment(); err != nil {
-					return err
+					if err := state.increment(); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -449,8 +457,16 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...*flag)
 					fmt.Fprintf(w, "'%c'", r2)
 				}
 				fmt.Fprintln(w, ":")
-				fmt.Fprintf(w, "\t\t\tstate += 0x%x", runeStates[r])
-				fmt.Fprintln(w)
+
+				if len(runes) == 1 {
+					// No need to update state; if this
+					// rune doesn't match, the matcher
+					// should bail immediately.
+					fmt.Fprintln(w, "\t\t\tbreak")
+				} else {
+					fmt.Fprintf(w, "\t\t\tstate += 0x%x", runeStates[r])
+					fmt.Fprintln(w)
+				}
 			}
 			fmt.Fprintln(w, "\t\tdefault:")
 			fmt.Fprintln(w, "\t\t\treturn", none)
@@ -486,7 +502,7 @@ func Generate(w io.Writer, cases map[string]string, none string, flags ...*flag)
 //
 // This function accepts flags (in order to match Generate's function
 // signature), but they are currently ignored.
-func GenerateReverse(w io.Writer, cases map[string]string, none string, _ ...*flag) error {
+func GenerateReverse(w io.Writer, cases map[string]string, none string, _ ...*Flag) error {
 	keys := make([]string, 0, len(cases))
 	for key := range cases {
 		keys = append(keys, key)

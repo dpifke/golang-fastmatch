@@ -1,5 +1,9 @@
 # pifke.org/fastmatch
 
+[![GoDoc](https://godoc.org/pifke.org/fastmatch?status.svg)](https://godoc.org/pifke.org/fastmatch)
+[![Test Coverage](https://coveralls.io/repos/github/dpifke/golang-fastmatch/badge.svg)](https://coveralls.io/github/dpifke/golang-fastmatch)
+[![Build Status](https://drone.io/github.com/dpifke/golang-fastmatch/status.png)](https://drone.io/github.com/dpifke/golang-fastmatch/latest)
+
 Golang code generation tool for quickly comparing an input string to a set of
 possible matches, which are known at compile time.
 
