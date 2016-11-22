@@ -35,12 +35,14 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// TestRuneEquivalents tests the construction of runeEquivalents via flags,
-// including sorting, de-duping, and transitivity.
+// TestRuneEquivalents tests the construction of runeEquivalents via flags
+// (including sorting, de-duping, and transitivity), as well as evaluation of
+// equivalence of individual runes.
 func TestRuneEquivalents(t *testing.T) {
 	equiv := makeRuneEquivalents(
 		Equivalent('a', 'b'),
@@ -60,11 +62,44 @@ func TestRuneEquivalents(t *testing.T) {
 	expect = []rune{'E', 'e'}
 	if !reflect.DeepEqual(expect, equiv.lookup('e')) {
 		t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup('e'), 'e')
+	} else {
+		expectStr := `'E', 'e'`
+		if equiv.lookupString('e') != expectStr {
+			t.Errorf("expected %q, got %q", expectStr, equiv.lookup('e'))
+		}
+
+		if !equiv.isEquiv('E', 'e') {
+			t.Error("should have been equivalent, but wasn't:", expectStr)
+		}
 	}
 
 	expect = []rune{'.'}
 	if !reflect.DeepEqual(expect, equiv.lookup('.')) {
 		t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup('.'), '.')
+	} else if equiv.isEquiv('.', 'e') {
+		t.Error("should not have been equivalent, but was: '.', 'e'")
+	}
+}
+
+// TestUniqueRunes tests deconstructing a series of strings at a given offset
+// to determine the unique runes, taking equivalence into account.
+func TestUniqueRunes(t *testing.T) {
+	keys := []string{"abc123", "ABC123", "DEF78"}
+	expect := [][]rune{
+		[]rune{'D', 'a'}, // note sort order (capitals < lowercase)
+		[]rune{'E', 'b'},
+		[]rune{'F', 'c'},
+		[]rune{'1', '7'},
+		[]rune{'2', '8'},
+		[]rune{'3'},
+	}
+	equiv := makeRuneEquivalents(Insensitive)
+
+	for n := range expect {
+		result := equiv.uniqueAtOffset(keys, n)
+		if !reflect.DeepEqual(expect[n], result) {
+			t.Errorf("expected %q, got %q at offset %d", expect[n], result, n)
+		}
 	}
 }
 
@@ -140,6 +175,10 @@ func expectMatch(t *testing.T, input, expect string) {
 
 // TestNoFlags tests a simple matcher.
 func TestNoFlags(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
 	cleanup, err := generateRunnable(Generate, "int", map[string]string{
 		"foo": "1",
 		"bar": "2",
@@ -154,10 +193,15 @@ func TestNoFlags(t *testing.T) {
 	expectMatch(t, "bar", "2")
 	expectMatch(t, "baz", "3")
 	expectMatch(t, "bat", "0")
+	expectMatch(t, "bazz", "0")
 }
 
 // TestInsensitive tests a case-insensitive matcher.
 func TestInsensitive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
 	cleanup, err := generateRunnable(Generate, "int", map[string]string{
 		"foo": "1",
 		"Bar": "2",
@@ -176,6 +220,10 @@ func TestInsensitive(t *testing.T) {
 
 // TestEquivalent tests a matcher which makes use of the Equivalent flag.
 func TestEquivalent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
 	cleanup, err := generateRunnable(Generate, "int", map[string]string{
 		"foo00000": "1",
 		"bar11111": "2",
@@ -193,8 +241,60 @@ func TestEquivalent(t *testing.T) {
 	expectMatch(t, "barzyxwv", "0")
 }
 
+// TestHasPrefix tests a prefix matcher.
+func TestHasPrefix(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+		"f":   "1",
+		"Bar": "2",
+		"baz": "3",
+	}, "0", HasPrefix, Insensitive)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "f", "1")
+	expectMatch(t, "foo", "1")
+	expectMatch(t, "FOO", "1")
+	expectMatch(t, "bar", "2")
+	expectMatch(t, "bart", "2")
+	expectMatch(t, "bz", "0")
+	expectMatch(t, "bzz", "0")
+}
+
+// TestHasSuffix tests a suffix matcher.
+func TestHasSuffix(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+		"o":  "1",
+		"ar": "2",
+	}, "0", HasSuffix, Insensitive)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "o", "1")
+	expectMatch(t, "flo", "1")
+	expectMatch(t, "FLO", "1")
+	expectMatch(t, "bao", "1")
+	expectMatch(t, "bar", "2")
+	expectMatch(t, "baz", "0")
+}
+
 // TestReverse tests a simple reverse matcher.
 func TestReverse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
 	cleanup, err := generateRunnable(GenerateReverse, "string", map[string]string{
 		"foo": `"1"`,
 		"bar": `"2"`,
@@ -218,8 +318,8 @@ func TestOverflow(t *testing.T) {
 		tooLong1: "1",
 		tooLong2: "2",
 	}, "0")
-	if err == nil {
-		t.Fatalf("long match didn't trigger overflow")
+	if err != ErrOverflow {
+		t.Fatalf("long match didn't trigger ErrOverflow")
 	}
 
 	err = Generate(ioutil.Discard, map[string]string{
@@ -230,43 +330,113 @@ func TestOverflow(t *testing.T) {
 	}
 }
 
+// TestBadFlags tests that Generate complains if passed impossible flags.
+func TestBadFlags(t *testing.T) {
+	for _, flags := range [][]*Flag{
+		[]*Flag{HasPrefix, HasSuffix},
+		[]*Flag{Normalize, HasSuffix, Insensitive, HasPrefix},
+	} {
+		if err := Generate(ioutil.Discard, map[string]string{"a": "1"}, "0", flags...); err != ErrBadFlags {
+			t.Errorf("failed to trigger ErrBadFlags")
+		}
+	}
+}
+
 // TestBadWriter tests that Generate and GenerateReverse return an error
 // if passed an unusable io.Writer.
-func TestBadFileHandle(t *testing.T) {
+func TestBadWriter(t *testing.T) {
 	f, _ := ioutil.TempFile("", "fastmatch_test")
 	f.Close()
 	os.Remove(f.Name())
 
-	if err := Generate(f, map[string]string{}, "0"); err == nil {
+	if err := Generate(f, map[string]string{"a": "1"}, "0"); err == nil {
 		t.Errorf("no error from Generate on closed io.Writer")
 	}
-	if err := GenerateReverse(f, map[string]string{}, `""`); err == nil {
+	if err := Generate(f, map[string]string{"a": "1"}, "0", HasPrefix); err == nil {
+		t.Errorf("no error from Generate (with HasPrefix) on closed io.Writer")
+	}
+	if err := GenerateReverse(f, map[string]string{"a": "1"}, `""`); err == nil {
 		t.Errorf("no error from GenerateReverse on closed io.Writer")
 	}
 }
 
-// TestAmbiguity tests that an error is returned if we're asked to generate
-// code with ambiguous matches, i.e. two strings that are equivalent to each
-// other but should return different values.
-func TestAmbiguity(t *testing.T) {
-	err := Generate(ioutil.Discard, map[string]string{
-		"Foo": "1",
-		"foo": "2",
-		"Bar": "3",
-		"bar": "4",
-	}, "0", Insensitive)
-	if err == nil {
-		t.Errorf("failed to detect ambiguity")
-	}
+var ambiguityTestCases = []struct {
+	descr string
+	cases map[string]string
+	flags []*Flag
+}{
+	{
+		descr: "Inensitive",
+		cases: map[string]string{
+			"Foo": "1", "foo": "2",
+			"Bar": "3", "bar": "4",
+		},
+		flags: []*Flag{Insensitive},
+	}, {
+		descr: "Inensitive (with HasPrefix)",
+		cases: map[string]string{
+			"Foo": "1", "foo": "2",
+			"Bar": "3", "bar": "4",
+		},
+		flags: []*Flag{Insensitive, HasPrefix},
+	}, {
+		descr: "Inensitive (with HaSuffix)",
+		cases: map[string]string{
+			"Foo": "1", "foo": "2",
+			"Bar": "3", "bar": "4",
+		},
+		flags: []*Flag{Insensitive, HasSuffix},
+	}, {
+		descr: "HasPrefix",
+		cases: map[string]string{
+			"foo": "1", "f": "2",
+		},
+		flags: []*Flag{HasPrefix},
+	}, {
+		descr: "HasPrefix",
+		cases: map[string]string{
+			"foo": "1", "fo": "2",
+			"bar": "3", "ba": "4",
+			"far": "5", "fa": "6",
+		},
+		flags: []*Flag{HasPrefix},
+	}, {
+		descr: "HasPrefix (different final rune)",
+		cases: map[string]string{
+			"oof": "1", "f": "2",
+		},
+		flags: []*Flag{HasSuffix},
+	}, {
+		descr: "HasPrefix (different intermediate state)",
+		cases: map[string]string{
+			"oof": "1", "of": "2",
+		},
+		flags: []*Flag{HasSuffix},
+	},
+}
 
-	// At first glance, this looks ambiguous, but since the equivalent
-	// strings both return the same value, it's actually OK.
-	err = Generate(ioutil.Discard, map[string]string{
-		"Foo": "1",
-		"foo": "1",
-	}, "0", Insensitive)
-	if err != nil {
-		t.Errorf("erroneously detected \"Foo\" = 1 and \"foo\" = 1 as ambiguous: %s", err.Error())
+// TestAmbiguity tests that an error is returned if we're asked to generate
+// code with ambiguous matches.
+func TestAmbiguity(t *testing.T) {
+	for _, testCase := range ambiguityTestCases {
+		if err := Generate(ioutil.Discard, testCase.cases, "0", testCase.flags...); err == nil {
+			t.Errorf("failed to detect %s ambiguity", testCase.descr)
+		} else {
+			for key := range testCase.cases {
+				if strings.Count(err.Error(), strconv.Quote(key)) != 1 {
+					t.Errorf("expected exactly 1 instance of %q in error message %q", key, err.Error())
+				}
+			}
+		}
+
+		// Remove the ambiguity by making all return values the same:
+		nonAmbiguous := make(map[string]string, len(testCase.cases))
+		for key := range testCase.cases {
+			nonAmbiguous[key] = "1"
+		}
+		if err := Generate(ioutil.Discard, nonAmbiguous, "0", testCase.flags...); err != nil {
+			t.Errorf("error from non-ambiguous %s cases: %s", testCase.descr, err.Error())
+		}
 	}
 }
 
