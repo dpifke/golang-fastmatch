@@ -30,25 +30,37 @@ package fastmatch
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"math"
 )
 
-// ErrOverflow is returned when the stateMachine runs out of space for storing
-// intermediate states.  The resolution is to reduce the length and/or
-// quantity of the input strings being matched.
-var ErrOverflow = errors.New("too many values to match (uint64 overflow)")
+// The maximum allowable state value.  Can be overridden for testing.
+var maxState uint64 = math.MaxUint64
 
 // stateMachine holds the mapping between a match and the intermediate state
 // changes (runes encountered) leading up to a match.
 type stateMachine struct {
-	next     uint64
-	base     uint64
-	final    map[string][]uint64
-	possible [][]rune
-	changes  []map[rune]uint64
-	noMore   []map[rune][]string
+	next      uint64
+	base      uint64
+	final     map[string][]uint64
+	possible  [][]rune
+	changes   []map[rune]uint64
+	noMore    []map[rune][]string
+	offset    int
+	continued *stateMachine
+	collapsed map[string]uint64
+}
+
+// foreachNoMore iterates over (length, final rune, key) tuples in the
+// stateMachine.noMore map.
+func (state *stateMachine) foreachNoMore(f func(int, rune, string)) {
+	for len := range state.noMore {
+		for r := range state.noMore[len] {
+			for _, key := range state.noMore[len][r] {
+				f(len, r, key)
+			}
+		}
+	}
 }
 
 // newStateMachine initializes a stateMachine.
@@ -64,31 +76,71 @@ func newStateMachine(keys []string) *stateMachine {
 	return state
 }
 
-// shift should be called at each new position, to ensure new intermediate
-// state values do not overlap with previous ones.
-func (state *stateMachine) shift() {
-	state.base = state.next
-}
-
-// increment creates a new intermediate state.  It returns an error if we have
-// too many intermediate states to fit in a uint64.
-func (state *stateMachine) increment() error {
-	if state.base > math.MaxUint64-state.next {
-		// TODO: we can work around this by creating an additional
-		// stateMachine and chaining to it.  I have a MIME type parser
-		// which must deal with abominations such as
-		// "application/vnd.openxmlformats-officedocument.presentationml.commentAuthors+xml",
-		// so I'll probably implement this sooner rather than later.
-		return ErrOverflow
+// makeNextStateMachine initializes an additional state machine once we've
+// exceeded the number of intermediate states which fit in a uint64.
+func (state *stateMachine) makeNextStateMachine(realOffset int) {
+	offset := realOffset - state.offset
+	if offset < 1 {
+		// This should only be possible during testing, when maxState
+		// != math.MaxUint64.
+		panic("maxState too small")
 	}
-	state.next += state.base
-	return nil
+
+	// The current switch statement is incomplete, so truncate any
+	// internal state learned on this pass.
+	state.possible = state.possible[:offset]
+	state.changes = state.changes[:offset]
+	state.noMore = state.noMore[:offset]
+
+	// Make a note of keys which finished at previous offsets; they don't
+	// need to be copied to the next state machine.  (This will be
+	// zero-length if we're not doing partial matching.)
+	finishedKeys := make(map[string]bool, len(state.final))
+	state.foreachNoMore(func(_ int, _ rune, key string) {
+		finishedKeys[key] = true
+	})
+
+	// Now create the next state machine, copying remaining keys to it.
+	state.continued = &stateMachine{
+		next:      1,
+		offset:    realOffset,
+		final:     make(map[string][]uint64, len(state.final)-len(finishedKeys)),
+		collapsed: make(map[string]uint64, len(state.final)-len(finishedKeys)),
+	}
+	for key := range state.final {
+		if finishedKeys[key] {
+			continue
+		}
+
+		// The current switch statement is incomplete, so forget any
+		// intermediate state we've noted for this key.
+		if state.offset == 0 {
+			state.final[key] = state.final[key][:offset]
+		} else {
+			// Need to include initial value from previous
+			// stateMachine.
+			state.final[key] = state.final[key][:offset+1]
+		}
+
+		// The current sum gets "collapsed" into a new state value in
+		// the next machine.  Note that many keys may share the same
+		// intermediate state.
+		before := state.finalString(key)
+		after := state.continued.collapsed[before]
+		if after == 0 {
+			after = state.continued.next
+			state.continued.next++
+			state.continued.collapsed[before] = after
+		}
+		state.continued.final[key] = append(make([]uint64, 0, len(key)-realOffset+1), after)
+	}
+	state.continued.base = state.continued.next
 }
 
 // indexKeys assigns a unique state value to each possible state change.  For
 // partial matching, this method also notes where the state should be checked
 // against possible final values.
-func (state *stateMachine) indexKeys(equiv runeEquivalents, partialMatch bool) error {
+func (state *stateMachine) indexKeys(equiv runeEquivalents, partialMatch bool) {
 	longestKey := 0
 	keys := make([]string, 0, len(state.final))
 	for key := range state.final {
@@ -99,15 +151,19 @@ func (state *stateMachine) indexKeys(equiv runeEquivalents, partialMatch bool) e
 	}
 
 	needShift := true
-	state.possible = make([][]rune, longestKey)
-	state.changes = make([]map[rune]uint64, longestKey)
-	state.noMore = make([]map[rune][]string, longestKey)
-	for offset := 0; offset < longestKey; offset++ {
-		state.possible[offset] = equiv.uniqueAtOffset(keys, offset)
+	state.possible = make([][]rune, longestKey-state.offset)
+	state.changes = make([]map[rune]uint64, longestKey-state.offset)
+	state.noMore = make([]map[rune][]string, longestKey-state.offset)
+	for realOffset := state.offset; realOffset < longestKey; realOffset++ {
+		offset := realOffset - state.offset
+
+		state.possible[offset] = equiv.uniqueAtOffset(keys, realOffset)
 
 		if len(state.possible[offset]) > 1 {
 			if needShift {
-				state.shift()
+				// This ensures new intermediate state values
+				// do not overlap with previous ones.
+				state.base = state.next
 				needShift = false
 			}
 
@@ -115,21 +171,33 @@ func (state *stateMachine) indexKeys(equiv runeEquivalents, partialMatch bool) e
 			for _, r := range state.possible[offset] {
 				needIncr := false
 				for _, key := range keys {
-					if partialMatch && offset >= len(key)-1 {
+					if partialMatch && realOffset >= len(key)-1 {
 						continue
 					}
-					if equiv.isEquiv(rune(key[offset]), r) {
+					if equiv.isEquiv(rune(key[realOffset]), r) {
 						state.final[key] = append(state.final[key], state.next)
 						needIncr = true
 					}
 				}
 				if needIncr {
-					state.changes[offset][r] = state.next
-					if err := state.increment(); err != nil {
-						return err
+					if state.base > maxState-state.next {
+						state.makeNextStateMachine(realOffset)
+						state.continued.indexKeys(equiv, partialMatch)
+						return
 					}
+					state.changes[offset][r] = state.next
+					state.next += state.base
 					needShift = true
 				}
+			}
+		} else {
+			// All of the keys share the same rune at this offset,
+			// so there's no state change.  However, we still need
+			// to write something to each key's state.final, so
+			// that offsets within that array match key offset.
+			// The zeroes will be omitted by state.finalString().
+			for _, key := range keys {
+				state.final[key] = append(state.final[key], 0)
 			}
 		}
 
@@ -137,15 +205,31 @@ func (state *stateMachine) indexKeys(equiv runeEquivalents, partialMatch bool) e
 		if partialMatch {
 			for _, r := range state.possible[offset] {
 				for _, key := range keys {
-					if len(key)-1 == offset && equiv.isEquiv(rune(key[offset]), r) {
+					if len(key)-1 == realOffset && equiv.isEquiv(rune(key[realOffset]), r) {
 						state.noMore[offset][r] = append(state.noMore[offset][r], key)
 					}
 				}
 			}
 		}
 	}
+}
 
-	return nil
+// remove removes a string from a slice of strings if present, in the same
+// manner the delete builtin can remove a key from a map.
+func remove(a []string, s string) []string {
+	for n := 0; n < len(a); n++ {
+		if a[n] == s {
+			if n < len(a)-1 {
+				copy(a[n:], a[n+1:])
+			}
+			a = a[:len(a)-1]
+		}
+	}
+
+	if len(a) == 0 {
+		return nil
+	}
+	return a
 }
 
 // deleteKey forgets about a possible match.  This is called by checkAmbiguity
@@ -156,35 +240,36 @@ func (state *stateMachine) deleteKey(key string) {
 
 	for _, noMore := range state.noMore {
 		for r := range noMore {
-			for n := range noMore[r] {
-				if noMore[r][n] == key {
-					if n < len(noMore[r])-1 {
-						copy(noMore[r][n:], noMore[r][n+1:])
-					}
-					noMore[r] = noMore[r][:len(noMore[r])-1]
-					if n >= len(noMore[r])-1 {
-						break
-					}
-				}
-			}
+			noMore[r] = remove(noMore[r], key)
 		}
 	}
+}
+
+// finalState returns the uint64 state value for a given key.
+func (state *stateMachine) finalState(key string) (sum uint64) {
+	for _, value := range state.final[key] {
+		sum += value
+	}
+	return
 }
 
 // finalString returns a string representing the final state of each key.  To
 // make the generated code slightly more readable, this consists of an
 // expression summing each intermediate state value (in hex).
 func (state *stateMachine) finalString(key string) string {
-	if len(state.final[key]) == 0 {
-		return "0"
-	}
-
 	var b bytes.Buffer
-	for n, value := range state.final[key] {
-		if n != 0 {
+	for _, value := range state.final[key] {
+		if value == 0 {
+			continue
+		}
+		if b.Len() != 0 {
 			b.WriteString(" + ")
 		}
 		b.WriteString(fmt.Sprintf("0x%x", value))
+	}
+
+	if b.Len() == 0 {
+		return "0"
 	}
 	return b.String()
 }

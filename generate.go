@@ -30,7 +30,6 @@ package fastmatch
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -38,7 +37,34 @@ import (
 )
 
 // ErrBadFlags is returned when nonsensical flags are passed to Generate.
-var ErrBadFlags = errors.New("HasPrefix and HasSuffix flags are mutually exclusive")
+type ErrBadFlags struct {
+	cannotCombine []string
+}
+
+func (e *ErrBadFlags) Error() string {
+	var b bytes.Buffer
+
+	sort.Strings(e.cannotCombine)
+	for n, key := range e.cannotCombine {
+		if n == 0 {
+			b.WriteString("flags are mutually exclusive: ")
+		} else if n == len(e.cannotCombine)-1 {
+			if n == 1 {
+				// last of two-item list
+				b.WriteString(" and ")
+			} else {
+				// last of longer list, with Oxford comma
+				// http://i3.kym-cdn.com/photos/images/newsfeed/000/946/427/5a4.jpg
+				b.WriteString(", and ")
+			}
+		} else {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Quote(key))
+	}
+
+	return b.String()
+}
 
 // Flag can be passed to Generate and GenerateReverse to modify the functions'
 // behavior.  Users of this package should not instantiate their own Flags.
@@ -123,17 +149,18 @@ func reverseString(s string) string {
 //	}, "-1", fastmatch.Insensitive)
 func Generate(w io.Writer, origCases map[string]string, none string, flags ...*Flag) error {
 	equiv := makeRuneEquivalents(flags...)
+
 	partialMatch := false
 	backwards := false
 	for _, flag := range flags {
 		if flag == HasPrefix {
 			if backwards {
-				return ErrBadFlags
+				return &ErrBadFlags{cannotCombine: []string{"HasPrefix", "HasSuffix"}}
 			}
 			partialMatch = true
 		} else if flag == HasSuffix {
 			if partialMatch && !backwards {
-				return ErrBadFlags
+				return &ErrBadFlags{cannotCombine: []string{"HasPrefix", "HasSuffix"}}
 			}
 			partialMatch = true
 			backwards = true
@@ -178,9 +205,7 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 	wroteSwitch := false
 	for _, l := range lengths {
 		state := newStateMachine(keys[l])
-		if err := state.indexKeys(equiv, partialMatch); err != nil {
-			return err
-		}
+		state.indexKeys(equiv, partialMatch)
 		if err := state.checkAmbiguity(cases, backwards); err != nil {
 			return err
 		}
@@ -206,11 +231,25 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "\t\tvar state uint64")
 
-		for offset := 0; offset < l; offset++ {
+		for realOffset := 0; realOffset < l; realOffset++ {
+			if state.continued != nil && state.continued.offset == realOffset {
+				fmt.Fprintln(w, "\t\tswitch state {")
+				for before, after := range state.continued.collapsed {
+					fmt.Fprintf(w, "\t\tcase %s:", before)
+					fmt.Fprintln(w)
+					fmt.Fprintf(w, "\t\t\tstate = 0x%x", after)
+					fmt.Fprintln(w)
+				}
+				fmt.Fprintln(w, "\t\t}")
+				state = state.continued
+			}
+
+			offset := realOffset - state.offset
+
 			if backwards {
-				fmt.Fprintf(w, "\t\tswitch input[len(input)-%d] {", offset+1)
+				fmt.Fprintf(w, "\t\tswitch input[len(input)-%d] {", realOffset+1)
 			} else {
-				fmt.Fprintf(w, "\t\tswitch input[%d] {", offset)
+				fmt.Fprintf(w, "\t\tswitch input[%d] {", realOffset)
 			}
 			fmt.Fprintln(w)
 			for _, r := range state.possible[offset] {
@@ -234,7 +273,7 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 					fmt.Fprintln(w)
 				}
 			}
-			if !partialMatch || offset != l-1 {
+			if !partialMatch || realOffset != l-1 {
 				fmt.Fprintln(w, "\t\tdefault:")
 				fmt.Fprintln(w, "\t\t\treturn", none)
 			}
@@ -271,6 +310,7 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 		fmt.Fprintln(w, "\t}") // end of "switch len(input)"
 	}
 	fmt.Fprintln(w, "\treturn", none)
+
 	_, err := fmt.Fprintln(w, "}") // end of func
 	return err
 }
@@ -285,6 +325,11 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 // This function accepts flags (in order to match Generate's function
 // signature), but they are currently ignored.
 func GenerateReverse(w io.Writer, cases map[string]string, none string, _ ...*Flag) error {
+	if err := checkReverseAmbiguity(cases); err != nil {
+		return err
+	}
+
+	// Case statements are written in alphabetic order by key
 	keys := make([]string, 0, len(cases))
 	for key := range cases {
 		keys = append(keys, key)
@@ -294,43 +339,72 @@ func GenerateReverse(w io.Writer, cases map[string]string, none string, _ ...*Fl
 	if _, err := fmt.Fprintln(w, "\tswitch input {"); err != nil {
 		return err
 	}
-	ambiguity := make(map[string][]string, len(cases))
 	for _, key := range keys {
-		ambiguity[cases[key]] = append(ambiguity[cases[key]], key)
 		fmt.Fprintf(w, "\tcase %s:", cases[key])
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "\t\treturn", strconv.Quote(key))
 	}
-
-	var b bytes.Buffer
-	for _, returnValues := range ambiguity {
-		if len(returnValues) == 1 {
-			continue
-		}
-
-		if b.Len() == 0 {
-			b.WriteString("ambiguous values: ")
-		} else {
-			b.Write([]byte{';', ' '})
-		}
-		first := true
-		for _, value := range returnValues {
-			if !first {
-				b.Write([]byte{',', ' '})
-			} else {
-				first = false
-			}
-			b.WriteString(strconv.Quote(value))
-		}
-	}
-	if b.Len() != 0 {
-		return errors.New(b.String())
-	}
-
 	fmt.Fprintln(w, "\tdefault:")
 	fmt.Fprintln(w, "\t\treturn", none)
-	fmt.Fprintln(w, "\t}")
-	fmt.Fprintln(w, "}")
+	fmt.Fprintln(w, "\t}") // end of switch
 
-	return nil
+	_, err := fmt.Fprintln(w, "}") // end of func
+	return err
+}
+
+// GenerateTest outputs a simple unit test which exercises the generated code.
+//
+// An error is returned if the supplied io.Writer is not valid.  As with
+// Generate and GenerateReverse, the caller is expected to write the method
+// signature (with a *testing.T argument named t) before calling this
+// function.
+//
+// fn and reverseFn should be the fmt.Printf-style format strings accepting a
+// single argument, which will be replaced with the test input for the
+// generated function.  This is typically something like "Function(%q)" for
+// the matcher and "%s.String()" for the reverse matcher.  Passing "" causes
+// the respective function to not be tested.
+//
+// Flags should match what was passed to Generate, but are currently ignored.
+// Future versions of this routine may output more sophisticated tests which
+// take flags into account.
+func GenerateTest(w io.Writer, fn, reverseFn string, cases map[string]string, _ ...*Flag) error {
+	keys := make([]string, 0, len(cases))
+	for key := range cases {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		if fn != "" {
+			_, err := fmt.Fprintf(w, "\tif %s != %s {", fmt.Sprintf(fn, key), cases[key])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(w)
+			fmt.Fprintf(w, "\t\tt.Errorf(\"wrong answer for %%q\", %q)", key)
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "\t}") // endif
+		}
+
+		if reverseFn != "" {
+			_, err := fmt.Fprintf(w, "\tif %s != %q {", fmt.Sprintf(reverseFn, cases[key]), key)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(w)
+
+			// Escape opening and closing quotes if needed:
+			s := cases[key]
+			if s[0] == '"' {
+				s = "\\" + s[:len(s)-1] + `\"`
+			}
+
+			fmt.Fprintf(w, "\t\tt.Errorf(\"wrong reverse answer for %s\")", s)
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "\t}") // endif
+		}
+	}
+	_, err := fmt.Fprintln(w, "}") // end of func
+	return err
 }

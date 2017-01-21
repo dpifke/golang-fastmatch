@@ -97,12 +97,5 @@ off in the short-term for using this method instead of a map lookup.
 will become more relevant.  I've played with having this package output
 assembler code, but it seems like the effort would be better spent improving
 the compiler instead.
-
-This probably isn't the right tool to use if your possible matches are longer
-than short words or phrases, or if you have a ridiculous number of them, since
-the state machine counter has to fit within a uint64.  It will return an error
-at code generation time if this limit is exceeded.  One could possibly work
-around this limitation by splitting up the search space using HasPrefix or
-HasSuffix.
 */
 package fastmatch

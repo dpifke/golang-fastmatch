@@ -29,28 +29,39 @@
 package fastmatch
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 )
 
-// generateFunc matches both Generate() and GenerateReverse().
-type generateFunc func(io.Writer, map[string]string, string, ...*Flag) error
+// testDirection is passed to generateRunnable to specify whether we should
+// use Generate or GenerateReverse for a particular test.
+type testDirection bool
+
+const (
+	match        testDirection = true  // use Generate
+	reverseMatch testDirection = false // use GenerateReverse
+)
 
 // generateRunnable creates a temporary directory, adds it GOPATH, and uses
-// Generate to create runnable string matcher code therein.
+// Generate or GenerateReverse to create runnable string matcher code therein.
+//
+// GenerateTest is also run, to generate and run the automated self-test;
+// failures are reported, however are non-fatal.
 //
 // A cleanup function is returned, which should be executed by the caller at
 // the completion of the test.  This removes the temporary directory and
 // restores GOPATH and the current working directory.
-func generateRunnable(fn generateFunc, retType string, cases map[string]string, none string, flags ...*Flag) (func(), error) {
+func generateRunnable(t *testing.T, which testDirection, retType string, cases map[string]string, none string, flags ...*Flag) (func(), error) {
 	cleanup := func() {}
 
-	var out io.Writer
+	var out, testOut io.Writer
 	dir, err := ioutil.TempDir("", "fastmatch_test")
 	if err == nil {
 		savedWd, _ := os.Getwd()
@@ -58,11 +69,14 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 		if err == nil {
 			savedGopath := os.Getenv("GOPATH")
 			os.Setenv("GOPATH", fmt.Sprintf("%s:%s", dir, savedGopath))
-			out, err = os.Create("test.go")
 			cleanup = func() {
 				os.Setenv("GOPATH", savedGopath)
 				os.Chdir(savedWd)
 				os.RemoveAll(dir)
+			}
+			out, err = os.Create("generated.go")
+			if err == nil {
+				testOut, err = os.Create("generated_test.go")
 			}
 		}
 	}
@@ -70,9 +84,11 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 		return cleanup, err
 	}
 
-	fmt.Fprintln(out, "package main")
+	_, err = fmt.Fprintln(out, "package main")
+	if err != nil {
+		return cleanup, err
+	}
 	fmt.Fprintln(out)
-
 	fmt.Fprintln(out, "import (")
 	fmt.Fprintln(out, "\t\"fmt\"")
 	fmt.Fprintln(out, "\t\"os\"")
@@ -80,7 +96,11 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 	fmt.Fprintln(out)
 
 	fmt.Fprintln(out, "func match(input string)", retType, "{")
-	err = fn(out, cases, none, flags...)
+	if which == match {
+		err = Generate(out, cases, none, flags...)
+	} else {
+		err = GenerateReverse(out, cases, none, flags...)
+	}
 	if err != nil {
 		return cleanup, err
 	}
@@ -88,15 +108,42 @@ func generateRunnable(fn generateFunc, retType string, cases map[string]string, 
 
 	fmt.Fprintln(out, "func main() {")
 	fmt.Fprintln(out, "\tfmt.Println(match(os.Args[1]))")
-	fmt.Fprintln(out, "}")
+	_, err = fmt.Fprintln(out, "}")
 
-	return cleanup, nil
+	// Also generate and run the self-test.  Errors generating or running
+	// the automated tests are recorded, but are not fatal.
+	var fwd, rev string
+	if which == match {
+		fwd = "match(%q)"
+		rev = ""
+	} else {
+		fwd = ""
+		rev = "match(%s)"
+	}
+	_, testErr := fmt.Fprintln(testOut, "package main")
+	if testErr == nil {
+		fmt.Fprintln(testOut)
+		fmt.Fprintln(testOut, "import \"testing\"")
+		fmt.Fprintln(testOut)
+		fmt.Fprintln(testOut, "func TestMatch(t *testing.T) {")
+		testErr = GenerateTest(testOut, fwd, rev, cases, flags...)
+	}
+	if testErr == nil {
+		testResult, err := exec.Command("go", "test").CombinedOutput()
+		if err != nil {
+			t.Errorf("%s: %s", err.Error(), strings.TrimSpace(string(testResult)))
+		}
+	} else {
+		t.Errorf("failed to generate test: %s", testErr.Error())
+	}
+
+	return cleanup, err
 }
 
 // expectMatch uses `go run` to execute our generated test.go file.  It passes
 // the provided input and compares the output to what the test expects.
 func expectMatch(t *testing.T, input, expect string) {
-	cmd := exec.Command("go", "run", "test.go", input)
+	cmd := exec.Command("go", "run", "generated.go", input)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s: %s", err.Error(), strings.TrimSpace(string(out)))
@@ -114,7 +161,7 @@ func TestNoFlags(t *testing.T) {
 		t.Skip("skipping compiled tests in short mode")
 	}
 
-	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
 		"foo": "1",
 		"bar": "2",
 		"baz": "3",
@@ -131,13 +178,30 @@ func TestNoFlags(t *testing.T) {
 	expectMatch(t, "bazz", "0")
 }
 
+// TestNoState tests matching a single string, no state machine required.
+func TestNoState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo": "1",
+	}, "0")
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+}
+
 // TestInsensitive tests a case-insensitive matcher.
 func TestInsensitive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compiled tests in short mode")
 	}
 
-	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
 		"foo": "1",
 		"Bar": "2",
 		"baz": "3",
@@ -159,7 +223,7 @@ func TestEquivalent(t *testing.T) {
 		t.Skip("skipping compiled tests in short mode")
 	}
 
-	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
 		"foo00000": "1",
 		"bar11111": "2",
 	}, "0", Equivalent('0', '1', '2', '3', '4', '5', '6', '7', '8', '9'))
@@ -182,7 +246,7 @@ func TestHasPrefix(t *testing.T) {
 		t.Skip("skipping compiled tests in short mode")
 	}
 
-	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
 		"f":   "1",
 		"Bar": "2",
 		"baz": "3",
@@ -207,7 +271,7 @@ func TestHasSuffix(t *testing.T) {
 		t.Skip("skipping compiled tests in short mode")
 	}
 
-	cleanup, err := generateRunnable(Generate, "int", map[string]string{
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
 		"o":  "1",
 		"ar": "2",
 	}, "0", HasSuffix, Insensitive)
@@ -224,13 +288,38 @@ func TestHasSuffix(t *testing.T) {
 	expectMatch(t, "baz", "0")
 }
 
+// TestChained tests chaining multiple state machines together, to match
+// longer strings.
+func TestChained(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	oldMaxState := maxState
+	defer func() { maxState = oldMaxState }()
+	maxState = 16
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"abcdef": "1",
+		"ghijkl": "2",
+	}, "0")
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "abcdef", "1")
+	expectMatch(t, "ghijkl", "2")
+	expectMatch(t, "123456", "0")
+}
+
 // TestReverse tests a simple reverse matcher.
 func TestReverse(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compiled tests in short mode")
 	}
 
-	cleanup, err := generateRunnable(GenerateReverse, "string", map[string]string{
+	cleanup, err := generateRunnable(t, reverseMatch, "string", map[string]string{
 		"foo": `"1"`,
 		"bar": `"2"`,
 	}, `"baz"`)
@@ -244,25 +333,16 @@ func TestReverse(t *testing.T) {
 	expectMatch(t, "0", "baz")
 }
 
-// TestOverflow attempts to Generate matcher code for strings that are too
-// long, which overflow the uint64 state machine.
-func TestOverflow(t *testing.T) {
-	tooLong1 := "Anything longer than about 64 characters should do nicely.  But"
-	tooLong2 := "we need more than one match, so that the state counter is used."
-	err := Generate(ioutil.Discard, map[string]string{
-		tooLong1: "1",
-		tooLong2: "2",
-	}, "0")
-	if err != ErrOverflow {
-		t.Fatalf("long match didn't trigger ErrOverflow")
+// typeOf returns the type name of a value, including pointer dereferences.
+func typeOf(v interface{}) string {
+	var b bytes.Buffer
+	t := reflect.TypeOf(v)
+	if t.Kind() == reflect.Ptr {
+		b.WriteString("*")
+		t = t.Elem()
 	}
-
-	err = Generate(ioutil.Discard, map[string]string{
-		tooLong1: "1",
-	}, "0")
-	if err != nil {
-		t.Errorf("a single match shouldn't overflow, since state machine is unnecessary")
-	}
+	b.WriteString(t.Name())
+	return b.String()
 }
 
 // TestBadFlags tests that Generate complains if passed impossible flags.
@@ -271,8 +351,16 @@ func TestBadFlags(t *testing.T) {
 		[]*Flag{HasPrefix, HasSuffix},
 		[]*Flag{Normalize, HasSuffix, Insensitive, HasPrefix},
 	} {
-		if err := Generate(ioutil.Discard, map[string]string{"a": "1"}, "0", flags...); err != ErrBadFlags {
+		err := Generate(ioutil.Discard, map[string]string{"a": "1"}, "0", flags...)
+		if err == nil {
 			t.Errorf("failed to trigger ErrBadFlags")
+		} else if err, ok := err.(*ErrBadFlags); !ok {
+			t.Errorf("expected *ErrBadFlags, got %s: %q", typeOf(err), err.Error())
+		} else {
+			errstr := err.Error()
+			if strings.Count(errstr, "HasPrefix") != 1 || strings.Count(errstr, "HasSuffix") != 1 {
+				t.Error("unexpected content from *ErrBadFlags.Error(): ", errstr)
+			}
 		}
 	}
 }
@@ -292,5 +380,11 @@ func TestBadWriter(t *testing.T) {
 	}
 	if err := GenerateReverse(f, map[string]string{"a": "1"}, `""`); err == nil {
 		t.Errorf("no error from GenerateReverse on closed io.Writer")
+	}
+	if err := GenerateTest(f, "Match", "", map[string]string{"a": "1"}); err == nil {
+		t.Errorf("no error from GenerateTest (forward matcher) on closed io.Writer")
+	}
+	if err := GenerateTest(f, "", "MatchReverse", map[string]string{"a": "1"}); err == nil {
+		t.Errorf("no error from GenerateTest (reverse matcher) on closed io.Writer")
 	}
 }
