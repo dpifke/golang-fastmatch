@@ -29,13 +29,11 @@
 package fastmatch
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -331,38 +329,6 @@ func TestReverse(t *testing.T) {
 	expectMatch(t, "1", "foo")
 	expectMatch(t, "2", "bar")
 	expectMatch(t, "0", "baz")
-}
-
-// typeOf returns the type name of a value, including pointer dereferences.
-func typeOf(v interface{}) string {
-	var b bytes.Buffer
-	t := reflect.TypeOf(v)
-	if t.Kind() == reflect.Ptr {
-		b.WriteString("*")
-		t = t.Elem()
-	}
-	b.WriteString(t.Name())
-	return b.String()
-}
-
-// TestBadFlags tests that Generate complains if passed impossible flags.
-func TestBadFlags(t *testing.T) {
-	for _, flags := range [][]*Flag{
-		[]*Flag{HasPrefix, HasSuffix},
-		[]*Flag{Normalize, HasSuffix, Insensitive, HasPrefix},
-	} {
-		err := Generate(ioutil.Discard, map[string]string{"a": "1"}, "0", flags...)
-		if err == nil {
-			t.Errorf("failed to trigger ErrBadFlags")
-		} else if err, ok := err.(*ErrBadFlags); !ok {
-			t.Errorf("expected *ErrBadFlags, got %s: %q", typeOf(err), err.Error())
-		} else {
-			errstr := err.Error()
-			if strings.Count(errstr, "HasPrefix") != 1 || strings.Count(errstr, "HasSuffix") != 1 {
-				t.Error("unexpected content from *ErrBadFlags.Error(): ", errstr)
-			}
-		}
-	}
 }
 
 // TestBadWriter tests that Generate and GenerateReverse return an error
