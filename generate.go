@@ -30,6 +30,7 @@ package fastmatch
 
 import (
 	"fmt"
+	"hash/fnv"
 	"io"
 	"sort"
 	"strconv"
@@ -62,12 +63,10 @@ func reverseString(s string) string {
 // different return values.  This function attempts to detect this and will
 // return an error if ambiguity is detected.
 //
-// An error is also returned if the provided io.Writer is invalid, or if there
-// are too many matches to fit within our uint64 state machine.
-//
 // The output is not buffered, and will be incomplete if an error is
 // returned.  If the caller cares about this, they should have a way to
-// discard the written output on error.
+// discard the written output on error.  Errors writing to the supplied
+// io.Writer will be passed back to the caller.
 //
 // Example usage:
 //
@@ -78,7 +77,8 @@ func reverseString(s string) string {
 //		"baz": "3",
 //	}, "-1", fastmatch.Insensitive)
 func Generate(w io.Writer, origCases map[string]string, none string, flags ...*Flag) error {
-	equiv := makeRuneEquivalents(flags...)
+	equiv := makeEquivalents(flags...)
+	var stop, ignore, ignoreExcept []rune
 
 	partialMatch := false
 	backwards := false
@@ -95,25 +95,110 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 			partialMatch = true
 			backwards = true
 		}
+		if len(flag.stop) > 0 {
+			stop = append(stop, flag.stop...)
+		}
+		if len(flag.ignore) > 0 {
+			if len(ignoreExcept) > 0 {
+				return &ErrBadFlags{cannotCombine: []string{"Ignore", "IgnoreExcept"}}
+			}
+			ignore = append(ignore, flag.ignore...)
+		}
+		if len(flag.ignoreExcept) > 0 {
+			if len(ignore) > 0 {
+				return &ErrBadFlags{cannotCombine: []string{"Ignore", "IgnoreExcept"}}
+			}
+			ignoreExcept = append(ignoreExcept, flag.ignoreExcept...)
+		}
 	}
 
-	// For backwards matching (HasSuffix), reverse the order of the
-	// strings being searched for:
+	// Check that stop and ignore runes are never equivalent.
+	var stopIgnore sortableRunes
+	for _, r1 := range stop {
+		for _, r2 := range ignore {
+			if equiv.isEquiv(r1, r2) {
+				stopIgnore = append(stopIgnore, r1)
+			}
+		}
+	}
+	if len(stopIgnore) > 0 {
+		return &ErrBadFlags{cannotStopIgnore: stopIgnore}
+	}
+
+	stop = equiv.expand(stop)
+	ignore = equiv.expand(ignore)
+	ignoreExcept = equiv.expand(ignoreExcept)
+
+	// Create a new map with the actual keys being searched for.  If stop
+	// runes were specified, the keys will be truncated if they contain
+	// the stop character.  If we're suffix matching, these will be in
+	// reverse order, since we examine the string back-to-front.  For
+	// purposes of error reporting, we also need to be able to map the
+	// modified key back to the original.
 	var cases map[string]string
-	if backwards {
+	var backToOrig map[string][]string
+	if len(stop) > 0 || len(ignore) > 0 || len(ignoreExcept) > 0 {
 		cases = make(map[string]string, len(origCases))
+		backToOrig = make(map[string][]string, len(origCases))
+
 		for key, value := range origCases {
-			cases[reverseString(key)] = value
+			if backwards {
+				key = reverseString(key)
+			}
+
+			newKey := make([]rune, 0, len(key))
+		mangleKey:
+			for _, r1 := range key {
+				for _, r2 := range stop {
+					if r1 == r2 {
+						break mangleKey
+					}
+				}
+				if len(ignoreExcept) > 0 {
+					notIgnored := false
+					for _, r2 := range ignoreExcept {
+						if r1 == r2 {
+							notIgnored = true
+							break
+						}
+					}
+					if !notIgnored {
+						continue mangleKey
+					}
+				} else {
+					for _, r2 := range ignore {
+						if r1 == r2 {
+							continue mangleKey
+						}
+					}
+				}
+				newKey = append(newKey, r1)
+			}
+			cases[string(newKey)] = value
+			backToOrig[string(newKey)] = append(backToOrig[string(newKey)], key)
+		}
+	} else if backwards {
+		cases = make(map[string]string, len(origCases))
+		backToOrig = make(map[string][]string, len(origCases))
+
+		for key, value := range origCases {
+			newKey := reverseString(key)
+			cases[newKey] = value
+			backToOrig[newKey] = append(backToOrig[newKey], key)
 		}
 	} else {
 		cases = origCases
 	}
+
+	// In order to generate (hopefully) unique labels, we hash the keys.
+	h := fnv.New32a()
 
 	// Search is partitioned based on the length of the input.  Split
 	// cases into each possible search space:
 	keys := make(map[int][]string)
 	for key := range cases {
 		keys[len(key)] = append(keys[len(key)], key)
+		h.Write([]byte(key))
 	}
 	lengths := sort.IntSlice(make([]int, 0, len(keys)))
 	for len := range keys {
@@ -132,11 +217,24 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 		}
 	}
 
+	inputAtOffset := func(off int) string {
+		if backwards {
+			if len(ignore) == 0 && len(ignoreExcept) == 0 {
+				return fmt.Sprintf("input[len(input)-%d]", off+1)
+			}
+			return fmt.Sprintf("input[len(input)-%d-ignored]", off+1)
+		}
+		if len(ignore) == 0 && len(ignoreExcept) == 0 {
+			return fmt.Sprintf("input[%d]", off)
+		}
+		return fmt.Sprintf("input[%d+ignored]", off)
+	}
+
 	wroteSwitch := false
 	for _, l := range lengths {
 		state := newStateMachine(keys[l])
 		state.indexKeys(equiv, partialMatch)
-		if err := state.checkAmbiguity(cases, backwards); err != nil {
+		if err := state.checkAmbiguity(cases, origCases, backToOrig); err != nil {
 			return err
 		}
 
@@ -145,7 +243,7 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 		// can bail if our effort is going to waste.  We also check it
 		// on the final write, to make sure our io.Writer is still
 		// good.
-		if partialMatch {
+		if partialMatch || len(stop) > 0 || len(ignore) > 0 || len(ignoreExcept) > 0 {
 			if _, err := fmt.Fprintf(w, "\tif len(input) >= %d {", l); err != nil {
 				return err
 			}
@@ -160,6 +258,9 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 		}
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "\t\tvar state uint64")
+		if len(ignore) > 0 || len(ignoreExcept) > 0 {
+			fmt.Fprintln(w, "\t\tvar ignored int")
+		}
 
 		for realOffset := 0; realOffset < l; realOffset++ {
 			if state.continued != nil && state.continued.offset == realOffset {
@@ -176,19 +277,32 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 
 			offset := realOffset - state.offset
 
-			if backwards {
-				fmt.Fprintf(w, "\t\tswitch input[len(input)-%d] {", realOffset+1)
-			} else {
-				fmt.Fprintf(w, "\t\tswitch input[%d] {", realOffset)
+			label := fmt.Sprintf("fastmatch_%x_l%d_o%d", h.Sum32(), l, realOffset)
+			writeIgnore := func(w io.Writer) {
+				fmt.Fprintf(w, "\t\t\tif len(input) <= ignored+%d {", l)
+				fmt.Fprintln(w)
+				fmt.Fprintln(w, "\t\t\t\treturn", none)
+				fmt.Fprintln(w, "\t\t\t}")
+				fmt.Fprintln(w, "\t\t\tignored++")
+				fmt.Fprintln(w, "\t\t\tgoto", label)
 			}
-			fmt.Fprintln(w)
+			if len(ignore) > 0 || len(ignoreExcept) > 0 {
+				fmt.Fprintln(w, "\t"+label+":")
+			}
+
+			fmt.Fprintln(w, "\t\tswitch", inputAtOffset(realOffset), "{")
+
+			if len(ignore) > 0 {
+				fmt.Fprintf(w, "\t\tcase %s:", quoteRunes(ignore))
+				fmt.Fprintln(w)
+				writeIgnore(w)
+			}
+
 			for _, r := range state.possible[offset] {
-				fmt.Fprintf(w, "\t\tcase %s:", equiv.lookupString(r))
+				fmt.Fprintf(w, "\t\tcase %s:", quoteRunes(equiv.lookup(r)))
 				fmt.Fprintln(w)
 
-				if len(state.noMore[offset][r]) == 1 {
-					fmt.Fprintln(w, "\t\t\treturn", cases[state.noMore[offset][r][0]])
-				} else if len(state.noMore[offset][r]) > 0 {
+				if len(state.noMore[offset][r]) > 0 {
 					fmt.Fprintln(w, "\t\t\tswitch state {")
 					for _, key := range state.noMore[offset][r] {
 						fmt.Fprintf(w, "\t\t\tcase %s:", state.finalString(key))
@@ -198,12 +312,33 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 					fmt.Fprintln(w, "\t\t\t}")
 				}
 
-				if state.changes[offset][r] > 0 {
+				if state.changes[offset][r] != 0 {
 					fmt.Fprintf(w, "\t\t\tstate += 0x%x", state.changes[offset][r])
 					fmt.Fprintln(w)
 				}
 			}
-			if !partialMatch || realOffset != l-1 {
+			if len(ignoreExcept) > 0 {
+				// If a non-ignored rune is not present in any
+				// of the matches at this position, finding it
+				// in the input causes matching to cease:
+				notInInput := equiv.expand(ignoreExcept, state.possible[offset], stop)
+				if len(notInInput) > 0 {
+					fmt.Fprintf(w, "\t\tcase %s:", quoteRunes(notInInput))
+					fmt.Fprintln(w)
+					fmt.Fprintln(w, "\t\t\treturn", none)
+				}
+
+				// Ignore all other runes:
+				fmt.Fprintln(w, "\t\tdefault:")
+				writeIgnore(w)
+			} else if !partialMatch || realOffset != l-1 {
+				// Any rune not present in any of the matches
+				// at this position causes matching to cease.
+				//
+				// (We can omit this on the last rune when
+				// partial matching, since we've already
+				// omitted our final switch block and the next
+				// statement will be a return none.)
 				fmt.Fprintln(w, "\t\tdefault:")
 				fmt.Fprintln(w, "\t\t\treturn", none)
 			}
@@ -217,9 +352,55 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 
 		if partialMatch {
 			// Final switch block has already been emitted.
-			fmt.Fprintln(w, "\t\treturn", none)
+			if l != lengths[len(lengths)-1] {
+				// We can omit this if we're at the end of the
+				// function.
+				fmt.Fprintln(w, "\t\treturn", none)
+			}
 			fmt.Fprintln(w, "\t}") // end of "if len(input)"
 		} else {
+			// If we relaxed our original length check due to
+			// StopUpon, Ignore, or IgnoreExcept flags, consume
+			// any remaining ignored runes and check that the
+			// string either terminates here or the next character
+			// is a stop character.
+			label := fmt.Sprintf("fastmatch_%x_l%d_final", h.Sum32(), l)
+			if len(ignore) > 0 || len(ignoreExcept) > 0 {
+				fmt.Fprintln(w, "\t"+label+":")
+				fmt.Fprintf(w, "\t\tif len(input) > %d+ignored {", l)
+				fmt.Fprintln(w)
+			} else if len(stop) > 0 {
+				fmt.Fprintf(w, "\t\tif len(input) > %d {", l)
+				fmt.Fprintln(w)
+			}
+			if len(ignore) > 0 || len(ignoreExcept) > 0 || len(stop) > 0 {
+				fmt.Fprintln(w, "\t\t\tswitch", inputAtOffset(l), "{")
+				if len(stop) > 0 {
+					fmt.Fprintf(w, "\t\t\tcase %s:", quoteRunes(stop))
+					fmt.Fprintln(w)
+					// empty case
+				}
+				if len(ignore) > 0 || len(ignoreExcept) > 0 {
+					if len(ignore) > 0 {
+						fmt.Fprintf(w, "\t\t\tcase %s:", quoteRunes(ignore))
+						fmt.Fprintln(w)
+					} else {
+						fmt.Fprintf(w, "\t\t\tcase %s:", quoteRunes(equiv.expand(ignoreExcept, stop)))
+						fmt.Fprintln(w)
+						fmt.Fprintln(w, "\t\t\t\treturn", none)
+						fmt.Fprintln(w, "\t\t\tdefault:")
+					}
+					fmt.Fprintln(w, "\t\t\t\tignored++")
+					fmt.Fprintln(w, "\t\t\t\tgoto", label)
+				}
+				if len(ignoreExcept) == 0 {
+					fmt.Fprintln(w, "\t\t\tdefault:")
+					fmt.Fprintln(w, "\t\t\t\treturn", none)
+				}
+				fmt.Fprintln(w, "\t\t\t}") // end of "switch input[l]"
+				fmt.Fprintln(w, "\t\t}")   // end of "if len(input) > l"
+			}
+
 			// Compare actual state to possible final values:
 			if len(state.final) == 1 && state.next == 1 {
 				for key := range state.final {
@@ -233,6 +414,9 @@ func Generate(w io.Writer, origCases map[string]string, none string, flags ...*F
 					fmt.Fprintln(w, "\t\t\treturn", cases[key])
 				}
 				fmt.Fprintln(w, "\t\t}")
+			}
+			if len(stop) > 0 || len(ignore) > 0 || len(ignoreExcept) > 0 {
+				fmt.Fprintln(w, "\t}") // end of "if len(input)"
 			}
 		}
 	}

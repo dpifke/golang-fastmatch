@@ -38,17 +38,25 @@ import (
 // ambiguous matches: cases where it's possible for the same input string to
 // match different return values.
 type ErrAmbiguous struct {
-	keys      []map[string]bool
-	backwards bool
+	keys []map[string]bool
 }
 
 // add provides one or more keys that are ambiguous with each other.
-func (e *ErrAmbiguous) add(keys ...string) {
+func (e *ErrAmbiguous) add(backToOrig map[string][]string, keys ...string) {
+	origKeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if k, found := backToOrig[key]; found {
+			origKeys = append(origKeys, k...)
+		} else {
+			origKeys = append(origKeys, key)
+		}
+	}
+
 	for n := range e.keys {
 		for existing := range e.keys[n] {
-			for _, other := range keys {
+			for _, other := range origKeys {
 				if existing == other {
-					for _, key := range keys {
+					for _, key := range origKeys {
 						e.keys[n][key] = true
 					}
 					return
@@ -57,8 +65,8 @@ func (e *ErrAmbiguous) add(keys ...string) {
 		}
 	}
 
-	e.keys = append(e.keys, make(map[string]bool, len(keys)))
-	for _, key := range keys {
+	e.keys = append(e.keys, make(map[string]bool, len(origKeys)))
+	for _, key := range origKeys {
 		e.keys[len(e.keys)-1][key] = true
 	}
 }
@@ -114,9 +122,6 @@ func (e *ErrAmbiguous) Error() string {
 
 		first := true
 		for _, key := range group {
-			if e.backwards {
-				key = reverseString(key)
-			}
 			if !first {
 				b.Write([]byte{',', ' '})
 			} else {
@@ -162,7 +167,7 @@ func (d *disambiguate) foreach(f func([]string, []string)) {
 }
 
 // add indexes a possible final state.
-func (d *disambiguate) add(sum uint64, r rune, ret string, key string) {
+func (d *disambiguate) add(sum uint64, r rune, ret, key string) {
 	if d.cases == nil {
 		d.cases = make(map[uint64]map[rune]seenCases)
 	}
@@ -252,8 +257,26 @@ func shortestString(ss []string) string {
 
 // checkAmbiguity verifies there is exactly one possible return value for each
 // final state, returning an error if any matches are ambiguous.
-func (state *stateMachine) checkAmbiguity(cases map[string]string, backwards bool) error {
-	e := &ErrAmbiguous{backwards: backwards}
+func (state *stateMachine) checkAmbiguity(cases, origCases map[string]string, backToOrig map[string][]string) error {
+	e := new(ErrAmbiguous)
+
+	// Keys which got mangled or truncated to the same value (due to
+	// StopUpon, Ignore, or IgnoreExcept) are caught first.
+	for _, keys := range backToOrig {
+		if len(keys) <= 1 {
+			continue
+		}
+		rets := make(map[string]bool, len(keys))
+		for _, key := range keys {
+			rets[origCases[key]] = true
+		}
+		if len(rets) > 1 {
+			// Only an issue if they have different return values.
+			e.add(nil, keys...)
+		}
+	}
+
+	// Now perform a more exhaustive search.
 	for {
 		d := new(disambiguate)
 		d.indexNoMore(state, cases)
@@ -274,7 +297,7 @@ func (state *stateMachine) checkAmbiguity(cases map[string]string, backwards boo
 					}
 				}
 			} else if len(keys) > 1 {
-				e.add(keys...)
+				e.add(backToOrig, keys...)
 			}
 		})
 
@@ -305,7 +328,7 @@ func checkReverseAmbiguity(cases map[string]string) error {
 	e := new(ErrAmbiguous)
 	for _, keys := range d {
 		if len(keys) > 1 {
-			e.add(keys...)
+			e.add(nil, keys...)
 		}
 	}
 

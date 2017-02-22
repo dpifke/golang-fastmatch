@@ -68,9 +68,9 @@ func TestSort(t *testing.T) {
 // TestErrAmbiguous tests construction and stringification of ErrAmbiguous.
 func TestErrAmbiguous(t *testing.T) {
 	e := new(ErrAmbiguous)
-	e.add("foo", "bar")
-	e.add("foo", "baz")
-	e.add("hello", "world")
+	e.add(nil, "foo", "bar")
+	e.add(nil, "foo", "baz")
+	e.add(nil, "hello", "world")
 
 	expect := []map[string]bool{
 		map[string]bool{"foo": true, "bar": true, "baz": true},
@@ -81,20 +81,6 @@ func TestErrAmbiguous(t *testing.T) {
 	}
 
 	for _, key := range []string{"foo", "bar", "baz", "hello", "world"} {
-		if strings.Count(e.Error(), strconv.Quote(key)) != 1 {
-			t.Errorf("expected exactly 1 instance of %q in error message %q", key, e.Error())
-		}
-	}
-}
-
-// TestBackwards tests that ErrAmbiguous reverses keys when appropriate when
-// generating an error message.
-func TestBackwards(t *testing.T) {
-	e := new(ErrAmbiguous)
-	e.add("abc", "def")
-	e.backwards = true
-
-	for _, key := range []string{"cba", "fed"} {
 		if strings.Count(e.Error(), strconv.Quote(key)) != 1 {
 			t.Errorf("expected exactly 1 instance of %q in error message %q", key, e.Error())
 		}
@@ -141,8 +127,8 @@ var ambiguityTestCases = []struct {
 			"bat": "5",
 		},
 		ambiguous: sliceOfStringSlices{
-			[]string{"ooF", "oof"},
-			[]string{"raB", "rab"},
+			[]string{"Foo", "foo"},
+			[]string{"Bar", "bar"},
 		},
 	}, {
 		descr: "Inensitive (chained state machine)",
@@ -204,7 +190,7 @@ var ambiguityTestCases = []struct {
 			"bar": "3",
 		},
 		ambiguous: sliceOfStringSlices{
-			[]string{"foo", "f"},
+			[]string{"oof", "f"},
 		},
 	}, {
 		descr: "HasSuffix (different intermediate state)",
@@ -213,7 +199,43 @@ var ambiguityTestCases = []struct {
 			"oof": "1", "of": "2",
 		},
 		ambiguous: sliceOfStringSlices{
-			[]string{"foo", "fo"},
+			[]string{"oof", "of"},
+		},
+	}, {
+		descr: "StopUpon",
+		flags: []*Flag{StopUpon('.')},
+		cases: map[string]string{
+			"foo": "1", "foo.": "2",
+			"bar.x": "3", "bar.y": "4",
+			"far": "5", "quick": "6",
+		},
+		ambiguous: sliceOfStringSlices{
+			[]string{"foo", "foo."},
+			[]string{"bar.x", "bar.y"},
+		},
+	}, {
+		descr: "Ignore",
+		flags: []*Flag{Ignore('.')},
+		cases: map[string]string{
+			"foo": "1", "foo.": "2",
+			"barx": "3", "bar.x": "4",
+			"far": "5", "quick": "6",
+		},
+		ambiguous: sliceOfStringSlices{
+			[]string{"foo", "foo."},
+			[]string{"barx", "bar.x"},
+		},
+	}, {
+		descr: "IgnoreExcept",
+		flags: []*Flag{IgnoreExcept('0', '1')},
+		cases: map[string]string{
+			"f0o0o": "1", "00": "2",
+			"ba11r": "3", "11": "4",
+			"101": "5", "010": "6",
+		},
+		ambiguous: sliceOfStringSlices{
+			[]string{"f0o0o", "00"},
+			[]string{"ba11r", "11"},
 		},
 	},
 }

@@ -32,7 +32,7 @@ import (
 	"bytes"
 	"io/ioutil"
 	"reflect"
-	"strings"
+	"sort"
 	"testing"
 )
 
@@ -48,22 +48,126 @@ func typeOf(v interface{}) string {
 	return b.String()
 }
 
-// TestBadFlags tests that Generate complains if passed impossible flags.
+var badFlagsTests = []struct {
+	flags     []*Flag
+	expect    *ErrBadFlags
+	expectStr string
+}{
+	{
+		flags: []*Flag{HasPrefix, HasSuffix},
+		expect: &ErrBadFlags{
+			cannotCombine: []string{"HasPrefix", "HasSuffix"},
+		},
+	}, {
+		flags: []*Flag{Normalize, HasSuffix, Insensitive, HasPrefix},
+		expect: &ErrBadFlags{
+			cannotCombine: []string{"HasPrefix", "HasSuffix"},
+		},
+	}, {
+		flags: []*Flag{Ignore('a'), IgnoreExcept('a')},
+		expect: &ErrBadFlags{
+			cannotCombine: []string{"Ignore", "IgnoreExcept"},
+		},
+	}, {
+		flags: []*Flag{IgnoreExcept(Alphanumeric...), Ignore(Numbers...)},
+		expect: &ErrBadFlags{
+			cannotCombine: []string{"Ignore", "IgnoreExcept"},
+		},
+	}, {
+		flags: []*Flag{StopUpon('a', 'x'), Ignore('y', 'a')},
+		expect: &ErrBadFlags{
+			cannotStopIgnore: []rune{'a'},
+		},
+	}, {
+		flags: []*Flag{StopUpon('a', 'b', 'c'), Ignore('A', 'B', 'C'), Insensitive},
+		expect: &ErrBadFlags{
+			cannotStopIgnore: []rune{'a', 'b', 'c'},
+		},
+	},
+}
+
+// TestBadFlags tests that Generate returns an error if impossible flags are
+// given.
 func TestBadFlags(t *testing.T) {
-	for _, flags := range [][]*Flag{
-		[]*Flag{HasPrefix, HasSuffix},
-		[]*Flag{Normalize, HasSuffix, Insensitive, HasPrefix},
-	} {
-		err := Generate(ioutil.Discard, map[string]string{"a": "1"}, "0", flags...)
+	for _, testCase := range badFlagsTests {
+		err := Generate(ioutil.Discard, map[string]string{"a": "1"}, "0", testCase.flags...)
 		if err == nil {
 			t.Errorf("failed to trigger ErrBadFlags")
 		} else if err, ok := err.(*ErrBadFlags); !ok {
 			t.Errorf("expected *ErrBadFlags, got %s: %q", typeOf(err), err.Error())
 		} else {
-			errstr := err.Error()
-			if strings.Count(errstr, "HasPrefix") != 1 || strings.Count(errstr, "HasSuffix") != 1 {
-				t.Error("unexpected content from *ErrBadFlags.Error(): ", errstr)
+			if errStr := err.Error(); errStr != testCase.expectStr && testCase.expectStr != "" {
+				t.Errorf("expected %q, got %q", testCase.expectStr, errStr)
 			}
+
+			if testCase.expect != nil {
+				sort.Strings(testCase.expect.cannotCombine)
+				sort.Sort(testCase.expect.cannotStopIgnore)
+
+				if !reflect.DeepEqual(err, testCase.expect) {
+					t.Errorf("internals of returned error did not match expected")
+				}
+			}
+		}
+	}
+}
+
+var rangeTests = []struct {
+	input, shouldInclude, shouldExclude []rune
+}{
+	{
+		input:         Range('c', 'e', 'h', 'j'),
+		shouldInclude: []rune{'c', 'd', 'e', 'h', 'i', 'j'},
+		shouldExclude: []rune{'a', 'b', 'f', 'g', 'k', 'l'},
+	}, {
+		input:         Numbers,
+		shouldInclude: []rune{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'},
+		shouldExclude: []rune{'a', 'A', 'z', 'Z', '!', '\n'},
+	}, {
+		input:         Uppercase,
+		shouldInclude: []rune{'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'},
+		shouldExclude: []rune{'a', 'z', '0', '9', '!', '\n'},
+	}, {
+		input:         Lowercase,
+		shouldInclude: []rune{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'},
+		shouldExclude: []rune{'A', 'Z', '0', '9', '!', '\n'},
+	}, {
+		input:         Letters,
+		shouldInclude: []rune{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'},
+		shouldExclude: []rune{'0', '9', '!', '\n'},
+	}, {
+		input:         Alphanumeric,
+		shouldInclude: []rune{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'},
+		shouldExclude: []rune{'!', '\n'},
+	},
+}
+
+// TestRange tests the Range function and predefined ranges.
+func TestRange(t *testing.T) {
+	for _, testCase := range rangeTests {
+		rm := make(map[rune]bool, len(testCase.input))
+		for _, r := range testCase.input {
+			rm[r] = true
+		}
+
+		var missing []rune
+		for _, r := range testCase.shouldInclude {
+			if !rm[r] {
+				missing = append(missing, r)
+			}
+		}
+		if len(missing) > 0 {
+			t.Error("runes missing from range:", quoteRunes(missing))
+		}
+
+		var extra []rune
+		for _, r := range testCase.shouldExclude {
+			if rm[r] {
+				extra = append(extra, r)
+			}
+		}
+		if len(extra) > 0 {
+			t.Error("extra runes in range:", quoteRunes(extra))
 		}
 	}
 }

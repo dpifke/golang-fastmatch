@@ -94,8 +94,8 @@ func (equiv dedupedRuneEquivalents) collapse() runeEquivalents {
 	return newEquiv
 }
 
-// makeRuneEquivalents builds our rune equivalence map based on flags.
-func makeRuneEquivalents(flags ...*Flag) runeEquivalents {
+// makeEquivalents builds our rune equivalence map based on flags.
+func makeEquivalents(flags ...*Flag) runeEquivalents {
 	equiv := make(dedupedRuneEquivalents)
 
 	for _, f := range flags {
@@ -126,15 +126,45 @@ func (equiv runeEquivalents) lookup(r rune) []rune {
 	return []rune{r}
 }
 
-// lookupString returns a string representing a map entry from
-// runeEquivalents.
-func (equiv runeEquivalents) lookupString(r rune) string {
+// expand returns a sorted, de-duped slice of runes (including equivalents)
+// from rs.  (This is similar to lookup, except it operates on a slice instead
+// of an individual rune.)
+//
+// Zero or more slices of runes (including equivalents) to exclude from the
+// output can be also specified.
+func (equiv runeEquivalents) expand(rs []rune, exclude ...[]rune) []rune {
+	rm := make(map[rune]bool, len(rs))
+findExclusions:
+	for _, r1 := range rs {
+		for _, excluded := range exclude {
+			for _, r2 := range excluded {
+				if equiv.isEquiv(r1, r2) {
+					continue findExclusions
+				}
+			}
+		}
+		for _, r2 := range equiv.lookup(r1) {
+			rm[r2] = true
+		}
+	}
+
+	newRs := make(sortableRunes, 0, len(rm))
+	for r := range rm {
+		newRs = append(newRs, r)
+	}
+	sort.Sort(newRs)
+
+	return newRs
+}
+
+// quoteRunes formats a slice of runes for use in a case statement.
+func quoteRunes(runes []rune) string {
 	var b bytes.Buffer
-	for _, r2 := range equiv.lookup(r) {
+	for _, r := range runes {
 		if b.Len() != 0 {
 			b.Write([]byte{',', ' '})
 		}
-		b.WriteString(strconv.QuoteRuneToASCII(r2))
+		b.WriteString(strconv.QuoteRuneToASCII(r))
 	}
 	return b.String()
 }

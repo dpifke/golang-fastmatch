@@ -286,6 +286,357 @@ func TestHasSuffix(t *testing.T) {
 	expectMatch(t, "baz", "0")
 }
 
+// TestStopUpon tests a matcher that's been directed to stop when a certain
+// rune is encountered.
+func TestStopUpon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo": "1",
+		"bar": "2",
+	}, "0", StopUpon('.'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+	expectMatch(t, "foo.", "1")
+	expectMatch(t, "foofoo", "0")
+	expectMatch(t, "bar.xyz", "2")
+	expectMatch(t, "baz", "0")
+	expectMatch(t, "b.az", "0")
+}
+
+// TestMultipleStopUpon tests that multiple StopUpon runes can be specified
+// and all will be honored.
+func TestMultipleStopUpon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo?bar": "1",
+		"bar!foo": "2",
+	}, "0", StopUpon('.', '!'), StopUpon('?'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+	expectMatch(t, "foo.quix", "1")
+	expectMatch(t, "bar?!?", "2")
+}
+
+// TestPrefixStopUpon tests combining StopUpon and HasPrefix flags.  This is
+// basically the same as HasPrefix, except inputs are truncated if the stop
+// rune is encountered.
+func TestPrefixStopUpon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo":  "1",
+		"b.ar": "2",
+	}, "0", HasPrefix, StopUpon('.'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+	expectMatch(t, "foo.", "1")
+	expectMatch(t, "foofoo", "1")
+	expectMatch(t, "baz", "2")
+	expectMatch(t, "b.az", "2")
+	expectMatch(t, "quix", "0")
+	expectMatch(t, "q.uix", "0")
+}
+
+// TestSuffixStopUpon tests combining StopUpon and HasSuffix flags.
+func TestSuffixStopUpon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		".foo": "1",
+		"bar":  "2",
+	}, "0", HasSuffix, StopUpon('.'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+	expectMatch(t, ".foo", "1")
+	expectMatch(t, "foofoo", "1")
+	expectMatch(t, "foo.bar", "2")
+	expectMatch(t, "bar", "2")
+	expectMatch(t, "barfar", "0")
+	expectMatch(t, ".", "0")
+}
+
+// TestStopUponEquivalent tests combining StopUpon and Equivalent flags.
+func TestStopUponEquivalent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo!bar": "1",
+		"bar.foo": "2",
+	}, "0", StopUpon('.'), Equivalent('.', '!'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+	expectMatch(t, "foo.", "1")
+	expectMatch(t, "foo!lala", "1")
+	expectMatch(t, "bar", "2")
+	expectMatch(t, "bar.", "2")
+	expectMatch(t, "bar!lala", "2")
+	expectMatch(t, "baz", "0")
+}
+
+// TestIgnore tests matching with ignored runes.
+func TestIgnore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		".f.o.o.": "1",
+		"bar":     "2",
+	}, "0", Ignore('.'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo", "1")
+	expectMatch(t, "f....o...o", "1")
+	expectMatch(t, "...foo...", "1")
+	expectMatch(t, ".bar", "2")
+	expectMatch(t, "bar.", "2")
+	expectMatch(t, "bar.f", "0")
+	expectMatch(t, "...", "0")
+}
+
+// TestMultipleIgnore tests that multiple Ignore runes can be specified.
+func TestMultipleIgnore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo?bar": "1",
+		"bar!foo": "2",
+	}, "0", Ignore('.', '!'), Ignore('?'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo...bar", "1")
+	expectMatch(t, "bar?!foo", "2")
+}
+
+// TestPrefixIgnore tests combining Ignore and HasPrefix.
+func TestPrefixIgnore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		".f.o.o.": "1",
+		"bar":     "2",
+	}, "0", Ignore('.'), HasPrefix)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foobar", "1")
+	expectMatch(t, "f....o...o....b....a.....r", "1")
+	expectMatch(t, "...bar", "2")
+	expectMatch(t, "f.a.r.", "0")
+}
+
+// TestSuffixIgnore tests combining Ignore and HasSuffix.
+func TestSuffixIgnore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		".foo": "1",
+		"bar":  "2",
+	}, "0", Ignore('.'), HasSuffix)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "barfoo", "1")
+	expectMatch(t, "bar.foo.", "1")
+	expectMatch(t, "z.z.z.b.a.r", "2")
+	expectMatch(t, "f.a.r.", "0")
+}
+
+// TestIgnoreEquivalent tests combining Ignore and Equivalent flags.
+func TestIgnoreEquivalent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"foo-bar": "1",
+		"bar_foo": "2",
+	}, "0", Ignore('-'), Equivalent('-', '_'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foobar", "1")
+	expectMatch(t, "f-o-ob_a_r", "1")
+	expectMatch(t, "barfoo", "2")
+	expectMatch(t, "___barfoo---", "2")
+	expectMatch(t, "bar", "0")
+}
+
+// TestIgnoreExcept tests matching where all but a subset of runes are
+// ignored.
+func TestIgnoreExcept(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"1x0x1x0x1": "1",
+		"zz00110zz": "2",
+	}, "0", IgnoreExcept('0', '1', '2'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "10101", "1")
+	expectMatch(t, "foo10101", "1")
+	expectMatch(t, "10101foo", "1")
+	expectMatch(t, "00-11-0", "2")
+	expectMatch(t, "abcdef", "0")
+	expectMatch(t, "101011", "0")
+}
+
+// TestMultipleIgnoreExcept tests that multiple IgnoreExcept flags get
+// combined properly.
+func TestMultipleIgnoreExcept(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"1x0x1x0x2": "1",
+		"zz22110zz": "2",
+	}, "0", IgnoreExcept('0', '1'), IgnoreExcept('2'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "foo10102", "1")
+	expectMatch(t, "22110bar", "2")
+}
+
+// TestIgnoreExceptEquivalent tests that Equivalent applies transitively to
+// IgnoreExcept.
+func TestIgnoreExceptEquvialent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"0202": "1",
+		"1111": "2",
+	}, "0", IgnoreExcept('0', '3'), Equivalent('0', '1'), Equivalent('2', '3'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "1313", "1")
+	expectMatch(t, "0000", "2")
+}
+
+// TestIgnoreExceptStopUpon tests combining IgnoreExcept and StopUpon.
+func TestIgnoreExceptStopUpon(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"abc123.321": "1",
+		"111def":     "2",
+	}, "0", IgnoreExcept('1', '2', '3'), StopUpon('.'))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "123", "1")
+	expectMatch(t, "xxx111.bar", "2")
+	expectMatch(t, "123321", "0")
+	expectMatch(t, "1111", "0")
+}
+
+// TestPrefixIgnoreExcept tests combining IgnoreExcept and HasPrefix.
+func TestPrefixIgnoreExcept(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"123": "1",
+		"111": "2",
+	}, "0", IgnoreExcept('1', '2', '3'), HasPrefix)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "123321", "1")
+	expectMatch(t, "foo111", "2")
+	expectMatch(t, "222", "0")
+}
+
+// TestSuffixIgnoreExcept tests combining IgnoreExcept and HasSuffix.
+func TestSuffixIgnoreExcept(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compiled tests in short mode")
+	}
+
+	cleanup, err := generateRunnable(t, match, "int", map[string]string{
+		"123": "1",
+		"111": "2",
+	}, "0", IgnoreExcept('1', '2', '3'), HasSuffix)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	expectMatch(t, "321123", "1")
+	expectMatch(t, "foo111bar", "2")
+	expectMatch(t, "222", "0")
+}
+
 // TestChained tests chaining multiple state machines together, to match
 // longer strings.
 func TestChained(t *testing.T) {

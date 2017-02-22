@@ -33,44 +33,88 @@ import (
 	"testing"
 )
 
-// TestRuneEquivalents tests the construction of runeEquivalents via flags
-// (including sorting, de-duping, and transitivity), as well as evaluation of
-// equivalence of individual runes.
+// TestRuneEquivalents tests the construction of runeEquivalents via the
+// Equivalent flag (including sorting, de-duping, and transitivity).
 func TestRuneEquivalents(t *testing.T) {
-	equiv := makeRuneEquivalents(
-		Equivalent('a', 'b'),
-		Equivalent('B', 'c'),
-		Insensitive,
-		Equivalent('c', 'd'),
-		Equivalent('a', 'c', 'd'),
+	equiv := makeEquivalents(
+		Equivalent('c', 'b'),
+		Equivalent('a', 'd'),
+		Equivalent('a', 'c'),
+		Equivalent('d', 'd', 'd', 'd'),
 	)
 
-	expect := []rune{'A', 'B', 'C', 'D', 'a', 'b', 'c', 'd'}
+	expect := []rune{'a', 'b', 'c', 'd'}
 	for _, r := range expect {
 		if !reflect.DeepEqual(expect, equiv.lookup(r)) {
 			t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup(r), r)
 		}
-	}
-
-	expect = []rune{'E', 'e'}
-	if !reflect.DeepEqual(expect, equiv.lookup('e')) {
-		t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup('e'), 'e')
-	} else {
-		expectStr := `'E', 'e'`
-		if equiv.lookupString('e') != expectStr {
-			t.Errorf("expected %q, got %q", expectStr, equiv.lookup('e'))
-		}
-
-		if !equiv.isEquiv('E', 'e') {
-			t.Error("should have been equivalent, but wasn't:", expectStr)
+		if !equiv.isEquiv(r, 'a') {
+			t.Errorf("%q should be equivalent to 'a'", r)
 		}
 	}
 
-	expect = []rune{'.'}
-	if !reflect.DeepEqual(expect, equiv.lookup('.')) {
-		t.Errorf("expected %q, got %q looking up %q", expect, equiv.lookup('.'), '.')
-	} else if equiv.isEquiv('.', 'e') {
-		t.Error("should not have been equivalent, but was: '.', 'e'")
+	// Also test the behavior of runes not in the equivalence set:
+	if !reflect.DeepEqual([]rune{'.'}, equiv.lookup('.')) {
+		t.Errorf("expected ['.'], got %q looking up '.'", equiv.lookup('.'))
+	}
+	if !equiv.isEquiv('.', '.') {
+		t.Errorf("'.' should be equivalent to itself")
+	}
+	if equiv.isEquiv('.', 'a') {
+		t.Error("'.' should not be equivalent to 'a'")
+	}
+}
+
+// TestRuneEquivalents tests the construction of runeEquivalents via the
+// Insensitive flag.
+func TestRuneInsensitive(t *testing.T) {
+	equiv := makeEquivalents(Insensitive)
+
+	if !reflect.DeepEqual([]rune{'E', 'e'}, equiv.lookup('e')) {
+		t.Errorf("expected ['E', 'e'], got %q looking up 'e'", equiv.lookup('e'))
+	}
+	if !equiv.isEquiv('E', 'e') {
+		t.Error("'E' should be equivalent to 'e'")
+	}
+	if equiv.isEquiv('E', 'f') {
+		t.Error("'E' should not be equivalent to 'f'")
+	}
+}
+
+var equivalentExpandTests = []struct {
+	args   []rune
+	expect []rune
+}{
+	{[]rune{'a'}, []rune{'a', 'b'}},
+	{[]rune{'b', 'a'}, []rune{'a', 'b'}},
+	{[]rune{'b', 'a', 'c'}, []rune{'a', 'b', 'c'}},
+	{[]rune{'b', 'c', 'a', 'b', 'c'}, []rune{'a', 'b', 'c'}},
+	{[]rune{'c'}, []rune{'c'}},
+	{[]rune{}, []rune{}},
+}
+
+// TestRuneEquivalentExpand tests expanding a list of runes to include
+// equivalents.  The output list should be sorted and de-duped.
+func TestRuneEquivalentExpand(t *testing.T) {
+	equiv := makeEquivalents(Equivalent('a', 'b'))
+
+	for _, testCase := range equivalentExpandTests {
+		actual := equiv.expand(testCase.args)
+		if !reflect.DeepEqual(testCase.expect, actual) {
+			t.Errorf("expected %q, got %q", testCase.expect, actual)
+		}
+	}
+}
+
+// TestRuneEquivalentExpandExclude tests runeEquivalent.expand() with lists of
+// runes to exclude.
+func TestRuneEquivalentExpandExclude(t *testing.T) {
+	equiv := makeEquivalents(Equivalent('a', 'b'), Equivalent('c', 'd'))
+
+	actual := equiv.expand([]rune{'f', 'c', 'f', 'a', 'e'}, []rune{'b', 'c'})
+	expect := []rune{'e', 'f'}
+	if !reflect.DeepEqual(expect, actual) {
+		t.Errorf("expected %q, got %q", expect, actual)
 	}
 }
 
@@ -86,12 +130,30 @@ func TestUniqueRunes(t *testing.T) {
 		[]rune{'2', '8'},
 		[]rune{'3'},
 	}
-	equiv := makeRuneEquivalents(Insensitive)
+	equiv := makeEquivalents(Insensitive)
 
 	for n := range expect {
 		result := equiv.uniqueAtOffset(keys, n)
 		if !reflect.DeepEqual(expect[n], result) {
 			t.Errorf("expected %q, got %q at offset %d", expect[n], result, n)
+		}
+	}
+}
+
+var quoteRunesTests = []struct {
+	input  []rune
+	expect string
+}{
+	{[]rune{'a'}, "'a'"},
+	{[]rune{'a', 'b'}, "'a', 'b'"},
+	{[]rune{'a', 'b', 'c'}, "'a', 'b', 'c'"},
+}
+
+// TestQuoteRunes tests the output of the quoteRunes function.
+func TestQuoteRunes(t *testing.T) {
+	for _, testCase := range quoteRunesTests {
+		if actual := quoteRunes(testCase.input); testCase.expect != actual {
+			t.Errorf("expected %q, got %q", testCase.expect, actual)
 		}
 	}
 }
